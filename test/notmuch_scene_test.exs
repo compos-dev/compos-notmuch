@@ -1,4 +1,4 @@
-defmodule Aimax.NotmuchSceneTest do
+defmodule Compos.NotmuchSceneTest do
   @moduledoc """
   The semantic scene path through real key dispatch.
 
@@ -9,7 +9,7 @@ defmodule Aimax.NotmuchSceneTest do
 
   use ExUnit.Case, async: false
 
-  alias Aimax.Core.{KeyDispatch, Session}
+  alias Compos.Core.{KeyDispatch, Session}
 
   defp eval!(source) do
     {:ok, printed} = Session.eval(source)

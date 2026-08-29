@@ -152,7 +152,7 @@ when a message has no text/plain part." 'group 'notmuch)
     s))
 
 (define (nm--html->text html)
-  (let ((tmp (string-append (expand-path "~") "/.aimax/mail-part.html")))
+  (let ((tmp (string-append (expand-path "~") "/.compos/mail-part.html")))
     (write-file! tmp html)
     (shell-command->string
       (string-append notmuch-html-renderer " < " (nm--quote tmp)))))
@@ -1176,7 +1176,7 @@ when a message has no text/plain part." 'group 'notmuch)
                                  (string-append "\n" *mail-header-separator* "\n"))
                    "\n\n"))
            (route (nm--send-route text))
-           (tmp (string-append (expand-path "~") "/.aimax/outgoing.eml")))
+           (tmp (string-append (expand-path "~") "/.compos/outgoing.eml")))
       (if (not route)
           (message "No send route matches — set notmuch-send-routes")
           (begin

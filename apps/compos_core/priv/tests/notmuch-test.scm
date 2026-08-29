@@ -19,7 +19,7 @@
 (tests-need-a-disposable-editor!
   "resets *notmuch*, *mail*, *mailboxes* and *compose*, which a live editor is using")
 
-(define t--nm-dir (string-append (aimax-home) "/zz-nm-stub"))
+(define t--nm-dir (string-append (compos-home) "/zz-nm-stub"))
 (define t--nm-program (string-append t--nm-dir "/notmuch"))
 
 ;; the JSON the stub prints, and the script that chooses between them
@@ -291,7 +291,7 @@
   "leaving mail returns you to what you were doing"
   (lambda ()
     (t--nm-setup!)
-    (let ((work (string-append (aimax-home) "/zz-nm-work.txt")))
+    (let ((work (string-append (compos-home) "/zz-nm-work.txt")))
       (write-file! work "work\n")
       (visit work)
       (run-command "notmuch")
