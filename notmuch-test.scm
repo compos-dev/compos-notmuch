@@ -91,7 +91,10 @@
                 (buffer-kill! b)))
             (buffer-list))
   ;; the suite runs in a live editor, whose frame may already be split;
-  ;; the window assertions below count what these commands opened
+  ;; the window assertions below count what these commands opened. The
+  ;; panes model goes too: a layout another suite left (a blank pane) does
+  ;; not know the index's window, and the preview then lands on the index
+  (panes-layout-forget!)
   (delete-other-windows!)
   t--nm-dir)
 
