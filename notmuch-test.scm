@@ -22,6 +22,37 @@
 (define t--nm-dir (string-append (compos-home) "/zz-nm-stub"))
 (define t--nm-program (string-append t--nm-dir "/notmuch"))
 
+;; The seams a test may replace, as the package defined them. Setup and
+;; teardown put every one back, so a test that fails half way through
+;; leaves no stub behind for the next one.
+(define t--nm-originals
+  (list nm--run nm--search-json nm--show-msgs nm--open-attachment! nm--open-thread!
+        nm--saved-searches nm--all-tags nm--db-path visit shell-command->string
+        *nm-db-paths*))
+(define (t--nm-restore!)
+  (let ((o t--nm-originals))
+    (set! nm--run (list-ref o 0))
+    (set! nm--search-json (list-ref o 1))
+    (set! nm--show-msgs (list-ref o 2))
+    (set! nm--open-attachment! (list-ref o 3))
+    (set! nm--open-thread! (list-ref o 4))
+    (set! nm--saved-searches (list-ref o 5))
+    (set! nm--all-tags (list-ref o 6))
+    (set! nm--db-path (list-ref o 7))
+    (set! visit (list-ref o 8))
+    (set! shell-command->string (list-ref o 9))
+    (set! *nm-db-paths* (list-ref o 10))))
+
+;; A shell callback runs on the lane the test holds, so it would land after
+;; the test. This runs it at once, with the real command's output.
+(define (t--nm-shell-at-once!)
+  (let ((shell (list-ref t--nm-originals 9)))
+    (set! shell-command->string
+      (lambda (cmd . more)
+        (if (and (pair? more) (procedure? (list-ref more (- (length more) 1))))
+            ((list-ref more (- (length more) 1)) (shell cmd))
+            (apply shell cmd more))))))
+
 ;; the JSON the stub prints, and the script that chooses between them
 (define t--nm-files
   (list
@@ -36,6 +67,7 @@
 ;; Every test starts from a clean stub and a clean editor: the call log is
 ;; what most of them read, and a stale one answers for the wrong test.
 (define (t--nm-setup!)
+  (t--nm-restore!)
   (shell-command->string (string-append "rm -rf " t--nm-dir))
   (make-directory! t--nm-dir)
   (for-each (lambda (f) (write-file! (string-append t--nm-dir "/" (car f)) (cadr f)))
@@ -66,6 +98,7 @@
 (define (t--nm-calls) (or (read-file (string-append t--nm-dir "/calls.log")) ""))
 
 (define (t--nm-done!)
+  (t--nm-restore!)
   (for-each (lambda (b)
               (when (or (equal? b "*notmuch*") (equal? b "*mailboxes*")
                         (string-prefix? "*mail" b) (equal? b "*compose*"))
@@ -282,14 +315,16 @@
   "the counts come from one batched call, not one per mailbox"
   (lambda ()
     (t--nm-setup!)
+    ;; a callback cannot land while the test holds the lane: the test
+    ;; holds the batch and answers it with the stub's real output
+    (t--nm-hold-counts!)
     (run-command "notmuch")
     (check-equal! (current-buffer) "*mailboxes*" "the mailbox list")
-    (check-true!
-      (wait-until (lambda ()
-                    (and (equal? (buffer-local-value 'nm-hello-status "*mailboxes*") "")
-                         (not (string-contains? (buffer-text "*mailboxes*") "loading counts"))))
-                  3000 10)
-      "the asynchronous counts arrive")
+    (let ((r (car t--nm-requests)))
+      ((cadr r) ((list-ref t--nm-originals 9) (car r))))
+    (check-true! (and (equal? (buffer-local-value 'nm-hello-status "*mailboxes*") "")
+                      (not (string-contains? (buffer-text "*mailboxes*") "loading counts")))
+      "the counts arrive")
     (let ((text (buffer-text "*mailboxes*")))
       (check-contains! text "Mailboxes" "the title")
       (check-contains! text "inbox" "a mailbox")
@@ -766,3 +801,646 @@
                        "0 means every move fetches")
       (set! notmuch-auto-preview saved))
     (t--nm-done!)))
+
+;;; --- attachments -----------------------------------------------------------------
+
+(define t--nm-attach-msg
+  '(id "message-one" headers (Subject "Report" From "Sender" Date "Today")
+    body ((id 1 content-type "multipart/mixed" content
+           ((id 2 content-type "multipart/alternative" content
+             ((id 3 content-type "text/plain" content "Plain body")
+              (id 4 content-type "text/html" content "<p>HTML body</p>")))
+            (id 5 content-type "application/pdf" filename "report & <q>.pdf")
+            (id 6 content-type "text/plain" filename "letter.txt" content "Attached text")
+            (id 7 content-type "text/html" filename "page.html" content "Attached HTML"))))))
+(define t--nm-attach-chosen #f)
+
+;; a thread page on one message with three attachments, read under one account
+(define (t--nm-attach-setup!)
+  (t--nm-setup!)
+  (set! notmuch-profile "attachment-account")
+  (set! t--nm-attach-chosen #f)
+  (set! nm--show-msgs (lambda (thread) (list t--nm-attach-msg)))
+  (set! nm--open-attachment! (lambda (a) (set! t--nm-attach-chosen a)))
+  (buffer-create "*mail*")
+  (switch-to-buffer! "*mail*")
+  (buffer-set-local! "*mail*" 'notmuch-thread "thread-one")
+  (buffer-set-local! "*mail*" 'notmuch-subject "Report")
+  (set-mode! "notmuch-show-mode"))
+
+(deftest 'nested-attachments-show-in-html-and-text-beside-the-body
+  "an attachment is named, never rendered in place of the body"
+  (lambda ()
+    (t--nm-attach-setup!)
+    (let ((html (nm--msg-html t--nm-attach-msg)))
+      (check-contains! html "report &amp; &lt;q&gt;.pdf" "the escaped pdf name")
+      (check-contains! html "letter.txt" "the text attachment")
+      (check-contains! html "page.html" "the html attachment")
+      (check-contains! html "HTML body" "the html body")
+      (check-false! (string-contains? html "Attached HTML") "not the attached html in its place"))
+    (let ((text (nm--msg-render t--nm-attach-msg)))
+      (check-contains! text "report & <q>.pdf" "the pdf name")
+      (check-contains! text "letter.txt" "the text attachment")
+      (check-contains! text "Plain body" "the plain body")
+      (check-false! (string-contains? text "Attached text") "not the attached text in its place"))
+    (t--nm-done!)))
+
+(deftest 'the-attachment-picker-uses-the-part-and-the-account-of-the-message
+  "switching account after the page opened does not change where the part comes from"
+  (lambda ()
+    (t--nm-attach-setup!)
+    (set! notmuch-profile "another-account")
+    (run-command "notmuch-open-attachment")
+    (t--nm-answer! "2. letter.txt")
+    (let ((chosen (value->string t--nm-attach-chosen)))
+      (check-contains! chosen "letter.txt" "the file")
+      (check-contains! chosen "--part=6" "its exact part")
+      (check-contains! chosen "id:message-one" "of its message")
+      (check-contains! chosen "attachment-account" "on the account the page was read on")
+      (check-false! (string-contains? chosen "another-account") "not the current one"))
+    (ignore-errors minibuffer-cancel!)
+    (t--nm-done!)))
+
+(deftest 'a-mode-reload-rebuilds-the-attachment-list
+  "the list is derived state, so the mode makes it again"
+  (lambda ()
+    (t--nm-attach-setup!)
+    (kill-local-variable! 'notmuch-attachments "*mail*")
+    (with-current-buffer "*mail*" (lambda () (set-mode! "notmuch-show-mode")))
+    (check-equal! (length (buffer-local-value 'notmuch-attachments "*mail*")) 3 "three attachments")
+    (t--nm-done!)))
+
+(deftest 'a-download-keeps-the-bytes-and-confines-the-file-name
+  "binary stays binary, and ../ cannot leave the new directory"
+  (lambda ()
+    (t--nm-attach-setup!)
+    (let ((opened #f))
+      (set! visit (lambda (path . rest) (set! opened path)))
+      (t--nm-shell-at-once!)
+      ((list-ref t--nm-originals 3) (list "../payload.bin" "printf '\\000\\377ABC'"))
+      (check-true! (and opened #t) "the download opened")
+      (when opened
+        (check-true! (string-suffix? "/payload.bin" opened) "under its own name")
+        (check-false! (string-contains? opened "..") "inside the new directory")
+        (check-equal! (string-trim (shell-command->string (string-append "od -An -tu1 " (sh-quote opened))))
+                      "0 255  65  66  67" "the exact bytes")
+        (shell-command->string (string-append "rm -rf \"$(dirname " (sh-quote opened) ")\""))))
+    (t--nm-done!)))
+
+;;; --- tag writes --------------------------------------------------------------------
+
+;; the message of the error THUNK raises, or #f when it raises none
+(define (t--nm-error-of thunk)
+  (let ((before (messages-newest)))
+    (report-errors "nm-test" thunk)
+    (let ((after (messages-newest)))
+      (and after (not (equal? after before)) (plist-get after 'text)))))
+
+(deftest 'a-failed-tag-write-surfaces-stderr
+  "a write that failed must never read as a success"
+  (lambda ()
+    (let ((err (t--nm-error-of
+                 (lambda () (nm--tag-result "1\nCouldn't open lockfile: Operation not permitted")))))
+      (check-contains! (or err "") "Notmuch tag failed" "it raises")
+      (check-contains! (or err "") "Operation not permitted" "with the reason"))
+    (check-equal! (nm--tag-result "0\n") "" "status 0 is a success")))
+
+(deftest 'a-tag-write-reports-the-real-exit-status
+  "also when the program fails without a word"
+  (lambda ()
+    (t--nm-setup!)
+    (let ((script (string-append t--nm-dir "/fail.sh")))
+      (write-file! script "#!/bin/sh\nexit 7\n")
+      (set! notmuch-program (string-append "sh " script))
+      (let ((err (or (t--nm-error-of (lambda () (nm--run "tag -inbox -- no-messages"))) "")))
+        (check-contains! err "Notmuch tag failed" "a silent failure raises")
+        (check-contains! err "7" "with its status"))
+      (write-file! script "#!/bin/sh\nprintf 'write denied' >&2\nexit 1\n")
+      (check-contains! (or (t--nm-error-of (lambda () (nm--run "tag -inbox -- no-messages"))) "")
+                       "write denied" "and a loud one says what it said"))
+    (t--nm-done!)))
+
+;;; --- mailbox counts ----------------------------------------------------------------
+
+;; Counts arrive in a callback. The stub holds each batch request, and a
+;; test answers them in the order it needs, late or out of order.
+(define t--nm-requests '())
+(define (t--nm-hold-counts!)
+  (set! t--nm-requests '())
+  (let ((shell (list-ref t--nm-originals 9)))
+    (set! shell-command->string
+      (lambda (cmd . more)
+        (if (and (pair? more) (string-contains? cmd "count --batch"))
+            (set! t--nm-requests
+              (append t--nm-requests (list (list cmd (list-ref more (- (length more) 1))))))
+            (apply shell cmd more))))))
+(define (t--nm-hello-setup! tags)
+  (t--nm-setup!)
+  (set! t--nm-requests '())
+  (set! notmuch-host "test-host")
+  (set! notmuch-profile "test-profile")
+  (set! nm--all-tags tags)
+  (set! nm--saved-searches (lambda () '(("inbox" "tag:inbox") ("unread" "tag:unread"))))
+  (set! nm--db-path (lambda () "/test/mail"))
+  (t--nm-hold-counts!)
+  (buffer-create "*zz-nm-origin*")
+  (switch-to-buffer! "*zz-nm-origin*"))
+(define (t--nm-hello-done!)
+  (t--nm-done!)
+  (when (buffer-known? "*zz-nm-origin*") (buffer-kill! "*zz-nm-origin*")))
+(define (t--nm-deliver! i out) ((cadr (list-ref t--nm-requests i)) out))
+(define (t--nm-first-box) (car (list-entries "*mailboxes*")))
+
+(deftest 'mailboxes-open-at-once-and-count-in-one-batch
+  "opening and moving never wait for the counts"
+  (lambda ()
+    (t--nm-hello-setup! (lambda () '()))
+    (run-command "notmuch")
+    (check-equal! (current-buffer) "*mailboxes*" "the list is open")
+    (check-equal! (length t--nm-requests) 1 "one request")
+    (check-contains! (buffer-text "*mailboxes*") "loading counts" "while the counts load")
+    (check-equal! (list-current "*mailboxes*") '("inbox" "tag:inbox" #f #f) "rows without counts")
+    (check-contains! (car (car t--nm-requests)) "count --batch" "a batch")
+    (check-equal! (nm--hello-count-queries (nm--saved-searches))
+                  '("tag:inbox" "( tag:inbox ) and tag:unread" "tag:unread" "( tag:unread ) and tag:unread")
+                  "total and unread of each mailbox")
+    (run-command "list-next")
+    (switch-to-buffer! "*zz-nm-origin*")
+    (check-equal! (length t--nm-requests) 1 "moving and leaving fetch nothing")
+    (t--nm-deliver! 0 "5\n2\n2\n2\n")
+    (check-equal! (current-buffer) "*zz-nm-origin*" "the answer moves nobody")
+    (check-equal! (list-current "*mailboxes*") '("unread" "tag:unread" #f #f) "the row moved to")
+    ;; a hidden list draws when it is shown; its rows have the counts now
+    (check-equal! (cadr (list-source-entries "*mailboxes*")) '("unread" "tag:unread" 2 2) "its counts arrived")
+    (check-equal! (buffer-local-value 'nm-hello-status "*mailboxes*") "" "loading is over")
+    (t--nm-hello-done!)))
+
+(deftest 'the-latest-count-refresh-wins
+  "answers that arrive out of order"
+  (lambda ()
+    (t--nm-hello-setup! (lambda () '()))
+    (run-command "notmuch")
+    (run-command "notmuch-hello-refresh")
+    (t--nm-deliver! 1 "9\n3\n3\n3\n")
+    (t--nm-deliver! 0 "5\n2\n2\n2\n")
+    (check-equal! (t--nm-first-box) '("inbox" "tag:inbox" 9 3) "the newer answer stays")
+    (t--nm-hello-done!)))
+
+(deftest 'an-account-switch-rejects-old-counts
+  "before and after the next fetch"
+  (lambda ()
+    (t--nm-hello-setup! (lambda () '()))
+    (run-command "notmuch")
+    (set! notmuch-profile "other-profile")
+    (t--nm-deliver! 0 "5\n2\n2\n2\n")
+    (check-equal! (t--nm-first-box) '("inbox" "tag:inbox" #f #f) "the old account's counts are refused")
+    (run-command "notmuch-hello-refresh")
+    (t--nm-deliver! 1 "8\n1\n1\n1\n")
+    (t--nm-deliver! 0 "5\n2\n2\n2\n")
+    (check-equal! (t--nm-first-box) '("inbox" "tag:inbox" 8 1) "also after the new ones came")
+    (t--nm-hello-done!)))
+
+(deftest 'failed-counts-stay-unknown-and-can-be-retried
+  "an error or a short answer is not a count"
+  (lambda ()
+    (t--nm-hello-setup! (lambda () '()))
+    (run-command "notmuch")
+    (t--nm-deliver! 0 "ssh: connection failed\n")
+    (check-contains! (buffer-text "*mailboxes*") "counts unavailable" "the failure says so")
+    (check-equal! (t--nm-first-box) '("inbox" "tag:inbox" #f #f) "no count")
+    (run-command "notmuch-hello-refresh")
+    (t--nm-deliver! 1 "5\n2\n")
+    (check-contains! (buffer-text "*mailboxes*") "counts unavailable" "a short answer too")
+    (run-command "notmuch-hello-refresh")
+    (t--nm-deliver! 2 "0\n0\n0\n0\n")
+    (check-equal! (t--nm-first-box) '("inbox" "tag:inbox" 0 0) "a retry that works")
+    (t--nm-hello-done!)))
+
+(deftest 'a-mode-restore-starts-counts-again
+  "the request lost with the restore is refused"
+  (lambda ()
+    (t--nm-hello-setup! (lambda () '()))
+    (run-command "notmuch")
+    (kill-local-variable! 'nm-hello-status "*mailboxes*")
+    (kill-local-variable! 'nm-hello-request "*mailboxes*")
+    (with-current-buffer "*mailboxes*" (lambda () (set-mode! "notmuch-hello-mode")))
+    (check-equal! (length t--nm-requests) 2 "a new request")
+    (t--nm-deliver! 0 "5\n2\n2\n2\n")
+    (check-equal! (t--nm-first-box) '("inbox" "tag:inbox" #f #f) "the lost one is refused")
+    (t--nm-deliver! 1 "7\n1\n1\n1\n")
+    (check-equal! (t--nm-first-box) '("inbox" "tag:inbox" 7 1) "the new one is taken")
+    (t--nm-hello-done!)))
+
+(deftest 'a-recreated-mailbox-buffer-rejects-the-old-request
+  "the request belongs to the buffer that made it"
+  (lambda ()
+    (t--nm-hello-setup! (lambda () '()))
+    (run-command "notmuch")
+    (buffer-kill! "*mailboxes*")
+    (run-command "notmuch")
+    (t--nm-deliver! 0 "5\n2\n2\n2\n")
+    (check-equal! (t--nm-first-box) '("inbox" "tag:inbox" #f #f) "the old request is refused")
+    (t--nm-deliver! 1 "6\n1\n1\n1\n")
+    (check-equal! (t--nm-first-box) '("inbox" "tag:inbox" 6 1) "the new one is taken")
+    (t--nm-hello-done!)))
+
+(deftest 'account-tags-are-mailboxes-once-each
+  "a tag without a saved search shows, and a tag with one is not repeated"
+  (lambda ()
+    (t--nm-hello-setup! (lambda () '("inbox" "unread" "investments" "invoice" "Follow up")))
+    (run-command "notmuch")
+    (check-equal! (map car (list-entries "*mailboxes*"))
+                  '("inbox" "unread" "investments" "invoice" "Follow up") "each once")
+    (t--nm-deliver! 0 "5\n2\n2\n2\n7\n3\n4\n1\n6\n0\n")
+    (check-equal! (map (lambda (row) (list (car row) (list-ref row 2) (list-ref row 3)))
+                       (list-entries "*mailboxes*"))
+                  '(("inbox" 5 2) ("unread" 2 2) ("investments" 7 3) ("invoice" 4 1) ("Follow up" 6 0))
+                  "and each with its counts")
+    (t--nm-hello-done!)))
+
+(deftest 'an-account-switch-shows-only-the-new-accounts-tags
+  "tags are per account"
+  (lambda ()
+    (t--nm-hello-setup! (lambda () (if (equal? notmuch-profile "test-profile") '("investments") '("candidates"))))
+    (run-command "notmuch")
+    (set! notmuch-profile "recruiting")
+    (run-command "notmuch-hello-refresh")
+    (check-equal! (map car (list-entries "*mailboxes*")) '("inbox" "unread" "candidates") "the new account's tags")
+    (t--nm-deliver! 0 "5\n2\n2\n2\n7\n3\n")
+    (check-equal! (map car (list-entries "*mailboxes*")) '("inbox" "unread" "candidates") "the old answer brings none back")
+    (t--nm-deliver! 1 "5\n2\n2\n2\n8\n1\n")
+    (check-equal! (list-ref (list-entries "*mailboxes*") 2) (list "candidates" (nm--tag-query "candidates") 8 1)
+                  "and the new answer counts them")
+    (t--nm-hello-done!)))
+
+(deftest 'a-tag-query-quotes-spaces-and-quotes
+  "a tag name is literal"
+  (lambda ()
+    (check-equal! (nm--tag-query "Follow up") "tag:\"Follow up\"" "a space")
+    (check-equal! (nm--tag-query "a\"b") "tag:\"a\"\"b\"" "an embedded quote")))
+
+;;; --- the preview pane --------------------------------------------------------------
+
+;; the thread the visible mail page holds, or #f
+(define (t--nm-shown)
+  (let ((p (find window-showing (nm--show-buffers))))
+    (and p (buffer-local-value 'notmuch-thread p))))
+(define (t--nm-preview-setup!)
+  (t--nm-setup!)
+  (set! notmuch-auto-preview #t))
+
+(deftest 'opening-the-inbox-previews-its-first-thread-and-keeps-focus
+  "the pane fills, the index keeps the keys"
+  (lambda ()
+    (t--nm-preview-setup!)
+    (t--nm-run! "notmuch-inbox")
+    (check-equal! (current-buffer) "*notmuch*" "the index is current")
+    (check-equal! (list-index "*notmuch*") 0 "on the first row")
+    (check-equal! (t--nm-shown) "0001" "the pane shows the first thread")
+    (check-contains! (buffer-text (nm--thread-buffer "0001")) "Hi there, this is the body." "its body")
+    (check-contains! (t--nm-calls) "tag -unread -- thread:0001" "and marks it read")
+    (t--nm-done!)))
+
+(deftest 'a-failed-read-tag-leaves-focus-in-the-index
+  "the index takes focus back before the write that can fail"
+  (lambda ()
+    (t--nm-setup!)
+    (run-command "notmuch-inbox")
+    (let ((run nm--run))
+      (set! nm--run (lambda (args . more)
+                      (if (string-prefix? "tag " args) (error "write denied") (apply run args more)))))
+    (check-false! (ignore-errors (lambda () (nm--preview! "*notmuch*") #t)) "the write raised")
+    (check-equal! (window-buffer (active-window)) "*notmuch*" "focus is in the index")
+    (t--nm-done!)))
+
+(deftest 'dismissal-closes-the-thread-before-mail-goes-back
+  "the first q closes the pane, the next leaves the index"
+  (lambda ()
+    (t--nm-preview-setup!)
+    (t--nm-run! "notmuch-inbox")
+    (let ((page (nm--thread-buffer "0001"))
+          (index (list-index "*notmuch*")))
+      (check-equal! (buffer-parent page) "*notmuch*" "the page is the index's child")
+      (t--nm-run! "dismiss-buffer")
+      (check-false! (buffer-known? page) "the page is closed")
+      (check-equal! (current-buffer) "*notmuch*" "the index is current")
+      (check-equal! (list-index "*notmuch*") index "on the same row")
+      (t--nm-run! "dismiss-buffer")
+      (check-true! (buffer-derived-mode? (current-buffer) "notmuch-hello-mode") "then back to the mailboxes"))
+    (t--nm-done!)))
+
+(deftest 'dismissal-from-the-thread-keeps-the-search
+  "closing the pane from inside it leaves the index open"
+  (lambda ()
+    (t--nm-preview-setup!)
+    (t--nm-run! "notmuch-inbox")
+    (let ((page (nm--thread-buffer "0001")))
+      (select-window! (window-showing page))
+      (t--nm-run! "dismiss-buffer")
+      (check-false! (buffer-known? page) "the page is closed"))
+    (check-true! (buffer-known? "*notmuch*") "the index stays")
+    (check-true! (and (window-showing "*notmuch*") #t) "on screen")
+    (t--nm-done!)))
+
+(deftest 'reopening-the-inbox-previews-its-first-thread-again
+  "the cached index goes back to the top, and the pane follows"
+  (lambda ()
+    (t--nm-preview-setup!)
+    (t--nm-run! "notmuch-inbox")
+    (t--nm-run! "notmuch-next")
+    (check-equal! (t--nm-shown) "0002" "the pane holds the second thread")
+    (t--nm-run! "notmuch-inbox")
+    (check-equal! (current-buffer) "*notmuch*" "the index is current")
+    (check-equal! (list-index "*notmuch*") 0 "on the first row")
+    (check-equal! (t--nm-shown) "0001" "and the pane holds the first thread")
+    (t--nm-done!)))
+
+(deftest 'opening-without-auto-preview-opens-no-pane
+  "no page, no window, no read mark"
+  (lambda ()
+    (t--nm-setup!)
+    (t--nm-run! "notmuch-inbox")
+    (check-true! (null? (nm--show-buffers)) "no page")
+    (check-equal! (length (window-list)) 1 "one window")
+    (check-false! (string-contains? (t--nm-calls) "tag ") "no tag write")
+    (t--nm-done!)))
+
+(deftest 'read-and-unread-toggles-stick-under-auto-preview
+  "the preview does not mark read again a thread the reader marked unread"
+  (lambda ()
+    (t--nm-preview-setup!)
+    (let ((unread #t) (run nm--run))
+      (set! nm--run
+        (lambda (args . more)
+          (cond ((equal? args "tag +unread -- thread:zz-thread") (set! unread #t))
+                ((equal? args "tag -unread -- thread:zz-thread") (set! unread #f)))
+          (apply run args more)))
+      (set! nm--search-json
+        (lambda (query limit)
+          (list (list 'thread "zz-thread" 'subject "Read state" 'authors "Alice"
+                      'date_relative "Today"
+                      'tags (if unread '("inbox" "unread") '("inbox"))))))
+      (t--nm-run! "notmuch-inbox")
+      (check-false! unread "the preview read it")
+      (t--nm-run! "notmuch-toggle-unread")
+      (check-true! unread "marked unread")
+      (check-true! (and (member "unread" (nm--th-tags (nm--thread-at "*notmuch*"))) #t) "and the row says so")
+      (t--nm-run! "notmuch-toggle-unread")
+      (check-false! unread "marked read")
+      (check-false! (member "unread" (nm--th-tags (nm--thread-at "*notmuch*"))) "and the row says so")
+      (check-equal! (current-buffer) "*notmuch*" "from the index"))
+    (t--nm-done!)))
+
+
+;; the select overlay holds point and each of TEXTS
+(define (t--nm-select-covers? . texts)
+  (let* ((text (buffer-text "*notmuch*"))
+         (spots (cons (buffer-point "*notmuch*")
+                      (map (lambda (s) (string-index text s)) texts))))
+    (pair? (filter (lambda (o)
+                     (and (equal? (list-ref o 2) "select")
+                          (null? (filter (lambda (x) (not (and x (<= (car o) x) (< x (cadr o)))))
+                                         spots))))
+                   (buffer-overlays "*notmuch*")))))
+
+(deftest 'the-highlight-follows-the-row-and-survives-a-mode-reload
+  "one highlight over both lines of the thread at point"
+  (lambda ()
+    (t--nm-setup!)
+    (t--nm-run! "notmuch-inbox")
+    (t--nm-run! "notmuch-next")
+    (check-equal! (nm--th-id (nm--thread-at "*notmuch*")) "0002" "the second thread")
+    (check-true! (t--nm-select-covers? "Quarterly report" "Bob") "highlighted, both lines")
+    (with-current-buffer "*notmuch*" (lambda () (set-mode! "notmuch-mode")))
+    (check-equal! (nm--th-id (nm--thread-at "*notmuch*")) "0002" "still the second thread")
+    (check-true! (t--nm-select-covers? "Quarterly report" "Bob") "still highlighted")
+    (t--nm-done!)))
+
+(deftest 'unfilter-after-filter-marked-restores-the-row
+  "the selected filter starts at the top; removing it goes back to the row"
+  (lambda ()
+    (t--nm-setup!)
+    (run-command "notmuch-inbox")
+    (list-goto-index! "*notmuch*" 1)
+    (run-command "notmuch-mark-toggle")
+    (run-command "notmuch-filter-marked")
+    (check-equal! (list-index "*notmuch*") 0 "the filter starts at its first row")
+    (run-command "notmuch-unfilter-last")
+    (check-equal! (nm--query-of "*notmuch*") "tag:inbox" "the filter is gone")
+    (check-equal! (list-index "*notmuch*") 1 "and the row is back")
+    (t--nm-done!)))
+
+(deftest 'mail-back-pops-one-filter-and-restores-its-row
+  "each back is one filter"
+  (lambda ()
+    (t--nm-setup!)
+    (run-command "notmuch-inbox")
+    (list-goto-index! "*notmuch*" 1)
+    (nm--query-push! "*notmuch*" "from:alice")
+    (nm--refresh! "*notmuch*")
+    (list-goto-index! "*notmuch*" 0)
+    (nm--query-push! "*notmuch*" "tag:unread")
+    (nm--refresh! "*notmuch*")
+    (run-command "notmuch-back")
+    (check-equal! (nm--query-of "*notmuch*") "( tag:inbox ) and from:alice" "one filter off")
+    (check-equal! (current-buffer) "*notmuch*" "in the index")
+    (run-command "notmuch-back")
+    (check-equal! (nm--query-of "*notmuch*") "tag:inbox" "the other off")
+    (check-equal! (list-index "*notmuch*") 1 "on the row it started from")
+    (t--nm-done!)))
+
+;;; --- selection and bulk tags -------------------------------------------------------
+
+;; A search of 10000 messages that loads two rows. The stub counts every
+;; call and fetch: selection is local, so most verbs here must make none.
+(define t--nm-tag-calls '())
+(define t--nm-tag-fetches 0)
+(define (t--nm-tag-quiet!) (set! t--nm-tag-calls '()) (set! t--nm-tag-fetches 0))
+(define (t--nm-tag-setup!)
+  (t--nm-setup!)
+  (t--nm-tag-quiet!)
+  (set! nm--search-json
+    (lambda (query limit)
+      (set! t--nm-tag-fetches (+ t--nm-tag-fetches 1))
+      (map (lambda (id) (list 'thread id 'subject id 'authors "Test" 'date_relative "Today"
+                              'tags '("inbox")))
+           '("one" "two"))))
+  (set! nm--run
+    (lambda (args . more)
+      (set! t--nm-tag-calls (append t--nm-tag-calls (list args)))
+      (cond ((string-prefix? "count " args) "10000\n")
+            ((equal? args "config get database.path") "/test/mail\n")
+            ((string-prefix? "search --output=tags" args) "inbox\nunread\n")
+            (else ""))))
+  (run-command "notmuch-inbox"))
+(define (t--nm-narrow!)
+  (nm--query-push! "*notmuch*" "from:alice")
+  (nm--refresh! "*notmuch*")
+  (t--nm-tag-quiet!))
+(define (t--nm-tag-writes) (filter (lambda (c) (string-prefix? "tag " c)) t--nm-tag-calls))
+(define (t--nm-tag-done!) (ignore-errors minibuffer-cancel!) (t--nm-done!))
+
+(deftest 'select-all-on-the-bare-inbox-is-refused-without-work
+  "the whole inbox is not a selection"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (t--nm-tag-quiet!)
+    (run-command "notmuch-mark-all")
+    (check-equal! t--nm-tag-calls '() "no call")
+    (check-equal! t--nm-tag-fetches 0 "no fetch")
+    (check-false! (nm--any-marked? "*notmuch*") "nothing selected")
+    (t--nm-tag-done!)))
+
+(deftest 'select-and-clear-ten-thousand-messages-without-work
+  "the selection is the query, not the rows"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (t--nm-narrow!)
+    (run-command "notmuch-mark-all")
+    (check-equal! (list-marks "*notmuch*") '(("one" "*") ("two" "*")) "the loaded rows show it")
+    (check-equal! (nm--marked-query "*notmuch*") "( ( tag:inbox ) and from:alice )" "the query")
+    (run-command "notmuch-unmark-all")
+    (check-equal! (list-marks "*notmuch*") '() "cleared")
+    (check-equal! t--nm-tag-calls '() "no call")
+    (check-equal! t--nm-tag-fetches 0 "no fetch")
+    (t--nm-tag-done!)))
+
+(deftest 'single-marks-survive-a-refresh-and-select-all-clears-them
+  "in the inbox, star clears a selection"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (run-command "notmuch-mark-toggle")
+    (nm--refresh! "*notmuch*")
+    (check-equal! (list-marks "*notmuch*") '(("one" "*")) "the mark stays")
+    (run-command "notmuch-mark-all")
+    (check-false! (nm--any-marked? "*notmuch*") "star clears it")
+    (t--nm-tag-done!)))
+
+(deftest 'bulk-add-tags-the-whole-selected-query
+  "one write on the query"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (t--nm-narrow!)
+    (run-command "notmuch-mark-all")
+    (run-command "notmuch-add-tag")
+    (t--nm-answer! "investments")
+    (check-equal! (car (t--nm-tag-writes)) "tag '+investments' -- '( ( tag:inbox ) and from:alice )'" "the write")
+    ;; the thread ids stay valid when their tags change, as for archive
+    (check-true! (nm--any-marked? "*notmuch*") "the selection stays")
+    (t--nm-tag-done!)))
+
+(deftest 'unmarking-a-row-of-select-all-excludes-its-thread
+  "without a round trip"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (t--nm-narrow!)
+    (run-command "notmuch-mark-all")
+    (run-command "notmuch-mark-toggle")
+    (check-equal! t--nm-tag-calls '() "no call")
+    (check-equal! t--nm-tag-fetches 0 "no fetch")
+    (check-equal! (list-marks "*notmuch*") '(("two" "*")) "the other row stays marked")
+    (run-command "notmuch-add-tag")
+    (t--nm-answer! "invoice")
+    (check-equal! (car (t--nm-tag-writes))
+                  "tag '+invoice' -- '( ( tag:inbox ) and from:alice ) and not ( thread:one )'" "the write excludes it")
+    (t--nm-tag-done!)))
+
+(deftest 'remove-tag-offers-the-tags-of-the-whole-selection
+  "not only the tags of the row at point"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (t--nm-narrow!)
+    (run-command "notmuch-mark-all")
+    (check-false! (member "unread" (nm--th-tags (nm--thread-at "*notmuch*"))) "point has no unread")
+    (run-command "notmuch-remove-tag")
+    (t--nm-answer! "unread")
+    (check-equal! (car t--nm-tag-calls) "search --output=tags -- '( ( tag:inbox ) and from:alice )'" "it asked the selection")
+    (check-equal! (cadr t--nm-tag-calls) "tag '-unread' -- '( ( tag:inbox ) and from:alice )'" "and wrote to it")
+    (t--nm-tag-done!)))
+
+(deftest 'a-single-mark-scopes-a-bulk-tag-to-its-thread-and-search
+  "the marked thread inside the search"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (run-command "notmuch-mark-toggle")
+    (run-command "notmuch-add-tag")
+    (t--nm-answer! "invoice")
+    (check-true! (and (member "tag '+invoice' -- '( tag:inbox ) and ( thread:one )'" t--nm-tag-calls) #t) "the write")
+    (t--nm-tag-done!)))
+
+(deftest 'without-a-selection-add-tag-tags-the-row-at-point
+  "point is the default"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (run-command "notmuch-add-tag")
+    (t--nm-answer! "invoice")
+    (check-true! (and (member "tag '+invoice' -- thread:one" t--nm-tag-calls) #t) "the write")
+    (t--nm-tag-done!)))
+
+(deftest 'a-filter-change-clears-the-selection-for-good
+  "going back does not bring it back"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (t--nm-narrow!)
+    (run-command "notmuch-mark-all")
+    (nm--query-push! "*notmuch*" "tag:unread")
+    (check-false! (nm--any-marked? "*notmuch*") "a new filter clears it")
+    (nm--query-pop! "*notmuch*")
+    (check-false! (nm--any-marked? "*notmuch*") "and back does not restore it")
+    (t--nm-tag-done!)))
+
+(deftest 'filter-marked-shows-the-selection-and-back-restores-the-filter
+  "the selected threads are a filter like any other"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (t--nm-narrow!)
+    (run-command "notmuch-mark-toggle")
+    (run-command "notmuch-filter-marked")
+    (check-equal! (nm--query-of "*notmuch*") "( ( tag:inbox ) and from:alice ) and ( thread:one )" "the selection")
+    (run-command "dismiss-buffer")
+    (check-equal! (nm--query-of "*notmuch*") "( tag:inbox ) and from:alice" "back to the filter")
+    (t--nm-tag-done!)))
+
+(deftest 'a-reload-keeps-the-selection-and-an-account-switch-drops-it
+  "a selection belongs to one account"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (t--nm-narrow!)
+    (run-command "notmuch-mark-all")
+    (with-current-buffer "*notmuch*" (lambda () (set-mode! "notmuch-mode")))
+    (check-true! (nm--any-marked? "*notmuch*") "kept across the reload")
+    (let ((old notmuch-profile))
+      (set! notmuch-profile "other")
+      (nm--selection "*notmuch*")
+      (set! notmuch-profile old))
+    (check-false! (nm--any-marked? "*notmuch*") "dropped by the switch")
+    (t--nm-tag-done!)))
+
+(deftest 'archive-follows-the-marks-after-a-yes
+  "nothing is written before the confirmation"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (run-command "notmuch-mark-toggle")
+    (check-equal! (list-marks "*notmuch*") '(("one" "*")) "one mark")
+    (run-command "notmuch-archive")
+    (check-equal! (t--nm-tag-writes) '() "it asks first")
+    (t--nm-answer! "yes")
+    (check-equal! (t--nm-tag-writes) '("tag -inbox -- '( tag:inbox ) and ( thread:one )'") "then archives the marks")
+    (t--nm-tag-done!)))
+
+(deftest 'the-header-counts-the-selection
+  "also a selection larger than the loaded rows"
+  (lambda ()
+    (t--nm-tag-setup!)
+    (run-command "notmuch-mark-toggle")
+    (check-contains! (nm--search-meta "*notmuch*") "1 thread selected" "one thread")
+    (run-command "notmuch-unmark-all")
+    (check-false! (string-contains? (nm--search-meta "*notmuch*") "selected") "none")
+    (t--nm-narrow!)
+    (run-command "notmuch-mark-all")
+    (check-contains! (nm--search-meta "*notmuch*") "All 10000 matching messages selected" "the whole query")
+    (check-equal! t--nm-tag-fetches 0 "no fetch")
+    (check-equal! t--nm-tag-calls '() "no call")
+    (run-command "notmuch-mark-toggle")
+    (check-contains! (nm--search-meta "*notmuch*") "All matching messages selected except 1 thread" "less one")
+    (t--nm-tag-done!)))
