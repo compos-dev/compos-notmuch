@@ -318,6 +318,19 @@ when a message has no text/plain part." 'group 'notmuch)
 (defface! 'nm-subject 'fg "color-mix(in srgb, var(--default-fg) 78%, var(--default-bg))")
 (defface! 'nm-tags 'fg "#64603a")
 (defface! 'nm-marked 'fg "#a03020" 'weight "700")
+
+;; A marked thread wears a bar and a tint, so a selection reads at a glance
+;; in the block view. The tint skips the cursor's row, so the cursor's own
+;; background still shows on a marked row and you can tell where you are.
+(define-style! 'notmuch-marked-rows "
+mail-threads > .semantic-direct[marked=true],
+mail-threads mail-thread[marked=true] {
+  box-shadow: inset 4px 0 var(--accent-fg, #e37170);
+}
+mail-threads mail-thread[marked=true]:not(.selected) {
+  background-color: color-mix(in srgb, var(--accent-fg, #e37170) 18%, transparent);
+}
+")
 (defface! 'nm-bar 'fg "#26356b")
 
 (define (nm--search-json query limit)
@@ -526,7 +539,9 @@ when a message has no text/plain part." 'group 'notmuch)
     'row-columns (lambda (buf) (nm--search-columns buf))
     'row-cells (lambda (buf th) (nm--search-cells buf th))
     'title (lambda (buf)
-             (string-append (nm--account-label) " · " (nm--query-label (nm--query-of buf))))
+             (let ((q (nm--query-of buf)))
+               (string-append (nm--account-label) " · " (nm--query-label q)
+                              " · " (nm--count-for buf q))))
     'meta (lambda (buf) (nm--search-meta buf))
     'total (lambda (buf) (length (list-entries buf)))
     'footer (lambda (buf)
@@ -1009,6 +1024,8 @@ when a message has no text/plain part." 'group 'notmuch)
 ;; fetch reads the thread, and reading it clears unread again. The verb
 ;; says so once, here, and the next pass consumes it.
 (define *nm-skip-follow* #f)
+;; the thread at point the last time the pane followed it
+(define *nm-follow-id* #f)
 (define (nm--skip-follow!) (set! *nm-skip-follow* #t))
 
 ;; the thread the reader dismissed the pane on, or #f
@@ -1033,8 +1050,15 @@ when a message has no text/plain part." 'group 'notmuch)
       ;; the pane went some other way than q: that is a dismissal too
       ((and *notmuch-pane-shown* (not (find window-showing (nm--show-buffers))))
        (set! *nm-dismissed* (nm--id-at buf)))
-      ;; a highlight on its way somewhere else should not cost a fetch
-      ((not (nm--pane-at-point? buf)) (nm--preview-soon! buf)))))
+      ;; the pane follows point, not the other way round: only a move to
+      ;; another thread refills it. A pane the user walked to another mail
+      ;; (s-[ / s-], C-x b) while point stays put keeps that mail.
+      (else
+       (let ((id (nm--id-at buf)))
+         (cond ((nm--pane-at-point? buf) (set! *nm-follow-id* id))
+               ((equal? id *nm-follow-id*) #f)
+               (else (set! *nm-follow-id* id)
+                     (nm--preview-soon! buf))))))))
 
 (define (nm--id-at buf)
   (let ((th (nm--thread-at buf))) (and th (nm--th-id th))))
@@ -2279,14 +2303,79 @@ them the address is live, so a purge never follows one."
           (string-join (map (lambda (p) (string-append "  " (plist-get p 'filename))) parts) "\n")
           "\n\n"))))
 
-(define (nm--attachment-html msg)
-  (let ((parts (nm--attachment-parts (plist-get msg 'body))))
+(define (nm--image-part? p)
+  (let ((ct (string-downcase (or (plist-get p 'content-type) ""))))
+    (and (string-prefix? "image/" ct) (not (string-contains? ct "svg")))))
+
+;; A thumbnail is cache: a small JPEG, base64, keyed by message and part.
+(define (nm--thumb-path msg p)
+  (cache-path "mail-thumbs"
+    (string-append (content-hash (string-append (or (plist-get msg 'id) "") "/"
+                                                (number->string (plist-get p 'id))))
+                   ".b64")))
+
+(define (nm--thumb-html msg p)
+  ;; an image shows its thumbnail; any other file the icon of the mode
+  ;; that opens it, the same glyph the buffer lists wear
+  (let ((path (nm--thumb-path msg p)))
+    (if (and (nm--image-part? p) (file-exists? path))
+        (string-append "<img alt=\"" (html-escape (plist-get p 'filename))
+                       "\" src=\"data:image/jpeg;base64," (read-file path) "\">")
+        (let ((glyph (file-icon (or (plist-get p 'filename) ""))))
+          (if (and (string? glyph) (not (string=? glyph "")))
+              (string-append "<i class=\"mail-file-icon\">" glyph "</i>")
+              "")))))
+
+;; inline images: the body names a part by cid:CONTENT-ID; draw its thumb there
+(define (nm--inline-cids msg html)
+  (fold (lambda (acc p)
+          (let ((cid (plist-get p 'content-id)) (path (nm--thumb-path msg p)))
+            (if (and (string? cid) (nm--image-part? p) (file-exists? path))
+                (string-replace acc (string-append "cid:" cid)
+                                (string-append "data:image/jpeg;base64," (read-file path)))
+                acc)))
+        html (nm--attachment-parts (plist-get msg 'body))))
+
+(define (nm--attachment-html msg &optional raw-html)
+  ;; an image the body already draws by cid: is not an attachment to list
+  (let* ((inline? (lambda (p)
+                    (let ((cid (plist-get p 'content-id)))
+                      (and (string? raw-html) (string? cid) (nm--image-part? p)
+                           (string-search (string-append "cid:" cid) raw-html)))))
+         (parts (filter (lambda (p) (not (inline? p)))
+                        (nm--attachment-parts (plist-get msg 'body)))))
     (if (null? parts) ""
         (string-append "<mail-attachments><strong>Attachments</strong>"
           (string-join (map (lambda (p)
-                             (string-append "<mail-attachment part-id=\"" (number->string (plist-get p 'id)) "\">" (html-escape (plist-get p 'filename)) "</mail-attachment>"))
+                             (string-append "<mail-attachment part-id=\"" (number->string (plist-get p 'id)) "\">"
+                                            (nm--thumb-html msg p)
+                                            "<span>" (html-escape (plist-get p 'filename)) "</span></mail-attachment>"))
                            parts) "")
           "<small>C-c a to open an attachment</small></mail-attachments>"))))
+
+;; Make the missing thumbnails of MSGS off the editor lane, then DONE.
+;; Bytes go notmuch -> file -> sips -> base64 file; never through Scheme.
+(define (nm--make-thumbs! msgs done)
+  (let ((jobs (fold (lambda (acc msg)
+                      (append acc
+                        (filter (lambda (x) x) (map (lambda (p)
+                                      (let ((out (nm--thumb-path msg p)))
+                                        (and (nm--image-part? p) (not (file-exists? out))
+                                             (string-append
+                                               "t=$(mktemp -d) && "
+                                               (nm--cmd (string-append "show --format=raw --part="
+                                                          (number->string (plist-get p 'id)) " -- "
+                                                          (sh-quote (string-append "id:" (plist-get msg 'id)))))
+                                               " > \"$t/in\" && sips -s format jpeg -Z 320 \"$t/in\" --out \"$t/t.jpg\" >/dev/null 2>&1"
+                                               " && base64 -i \"$t/t.jpg\" | tr -d '\\n' > " (sh-quote (string-append out ".part"))
+                                               " && mv " (sh-quote (string-append out ".part")) " " (sh-quote out)
+                                               "; rm -rf \"$t\""))))
+                                    (nm--attachment-parts (plist-get msg 'body))))))
+                    '() msgs)))
+    (unless (null? jobs)
+      (shell-command->string (string-append (string-join jobs " ; ") " ; printf thumbs-done")
+        (cache-path "mail-thumbs" "")
+        (lambda (result) (done))))))
 
 ;; Capture the full fetch command while this message's account is active.
 ;; The user can switch accounts while the attachment picker is open.
@@ -2306,6 +2395,45 @@ them the address is live, so a purge never follows one."
                              (string-join (string-split name "\\") "/") "/")))))
     (if (member base '("" "." "..")) "attachment" base)))
 
+(define nm--pdf-unlock-js
+  "var d=Document.openDocument(scriptArgs[0]);
+if(!d.needsPassword()){print('plain')}
+else{var p=null;try{p=readline()}catch(e){}
+ if(p===null||!d.authenticatePassword(p)){print('locked')}
+ else{d.save(scriptArgs[1],'decrypt');print('unlocked')}}
+")
+
+;; A PDF with a password asks for it, then opens an unlocked copy beside it.
+;; The password reaches mutool on stdin from a file in the private part
+;; directory, never on a command line, and the file is gone at once.
+(define (nm--open-pdf! dir file name)
+  (let* ((path (string-append dir "/" file))
+         (js (string-append dir "/.unlock.js"))
+         (pw (string-append dir "/.pw"))
+         (out (string-append dir "/unlocked-" file))
+         (run (lambda (stdin k)
+                (shell-command->string
+                  (string-append "mutool run " (sh-quote js) " " (sh-quote path) " " (sh-quote out)
+                                 " < " stdin " 2>/dev/null; rm -f " (sh-quote pw))
+                  (lambda (r) (k (string-trim r)))))))
+    (write-file! js nm--pdf-unlock-js)
+    (letrec ((ask (lambda (prompt)
+                    (minibuffer-read prompt '()
+                      (lambda (input)
+                        (if (or (not (string? input)) (string=? input ""))
+                            (message "Not opened: no password")
+                            (begin
+                              (write-file! pw input)
+                              (run (sh-quote pw)
+                                   (lambda (r)
+                                     (cond ((equal? r "unlocked") (visit out))
+                                           (else (ask (string-append "Wrong password for " name ": ")))))))))))))
+      (run "/dev/null"
+           (lambda (r)
+             (if (equal? r "locked")
+                 (ask (string-append "Password for " name ": "))
+                 (visit path)))))))
+
 (define (nm--open-attachment! attachment)
   ;; Mail attachments can be fetched again from notmuch: they are cache.
   (let* ((root (cache-path "attachments" "")))
@@ -2321,11 +2449,12 @@ them the address is live, so a purge never follows one."
             (shell-command->string
               (string-append (cadr attachment) " > " (sh-quote path) " && printf attachment-ok")
               (lambda (result)
-                (if (equal? result "attachment-ok")
-                    (visit path)
-                    (begin
-                      (when (file-exists? path) (delete-file! path))
-                      (message "Attachment download failed"))))))))))
+                (cond ((not (equal? result "attachment-ok"))
+                       (when (file-exists? path) (delete-file! path))
+                       (message "Attachment download failed"))
+                      ((string-suffix? ".pdf" (string-downcase path))
+                       (nm--open-pdf! dir (nm--attachment-filename (car attachment)) (car attachment)))
+                      (else (visit path))))))))))
 
 (define-command "notmuch-open-attachment" "Choose and open an attachment from the selected mail thread"
   (lambda ()
@@ -2453,12 +2582,98 @@ them the address is live, so a purge never follows one."
 
 ;; the whole thread as one HTML document for the sandboxed iframe:
 ;; our headers, their bodies (plain text becomes <pre>)
+;; A reply carries the whole history it answers. The thread page folds
+;; that history behind a toggle: everything from the first quote marker
+;; on goes into a closed <details>. The text view and the mail tools keep
+;; the full body.
+(define nm--quote-tag-markers
+  '("class=\"gmail_quote" "class=\"x_gmail_quote" "id=\"appendonsend"
+    "id=\"x_appendonsend" "id=\"divRplyFwdMsg" "id=\"x_divRplyFwdMsg"
+    "border-top:solid #E1E1E1" "border-top:solid #B5C4DF"
+    "OLK_SRC_BODY_SECTION" "<blockquote type=\"cite\""))
+
+(define nm--quote-text-markers
+  '("-----Original Message-----" "-----Original message-----"))
+
+(define (nm--last-before needle s end)
+  (let loop ((from 0) (last #f))
+    (let ((i (string-search needle s from)))
+      (if (and i (< i end)) (loop (+ i 1) i) last))))
+
+(define (nm--min-index xs)
+  (fold (lambda (acc x) (if (and x (or (not acc) (< x acc))) x acc)) #f xs))
+
+;; where the quoted history of an html body starts: the opening tag of
+;; the element that holds the first marker, or #f
+(define (nm--html-quote-start html)
+  (nm--min-index
+    (append
+      (map (lambda (m)
+             (let ((i (string-search m html)))
+               (and i (nm--last-before "<" html (+ i 1)))))
+           nm--quote-tag-markers)
+      (map (lambda (m)
+             (let ((i (string-search m html)))
+               (and i (let ((p (nm--last-before "<p" html i))
+                             (d (nm--last-before "<div" html i)))
+                         (if (and p d) (max p d) (or p d))))))
+           nm--quote-text-markers))))
+
+;; #t when HTML shows no words: tags, style, script and spaces only
+(define (nm--html-blank? html)
+  (let* ((b (string-search "<body" html))
+         (s (if b (substring html b (string-length html)) html))
+         (n (string-length s)))
+    (let loop ((i 0) (in-tag #f))
+      (cond ((>= i n) #t)
+            ((char=? (string-ref s i) #\<) (loop (+ i 1) #t))
+            ((char=? (string-ref s i) #\>) (loop (+ i 1) #f))
+            (in-tag (loop (+ i 1) #t))
+            ((char-whitespace? (string-ref s i)) (loop (+ i 1) #f))
+            ((and (char=? (string-ref s i) #\&)
+                  (string-prefix? "&nbsp;" (substring s i (min n (+ i 6)))))
+             (loop (+ i 6) #f))
+            (else #f)))))
+
+(define (nm--quote-details open? inner)
+  (string-append "<details class=\"mail-quoted\"" (if open? " open" "") ">"
+                 "<summary>··· quoted text</summary>" inner "</details>"))
+
+(define (nm--fold-html-quote html)
+  (let ((i (nm--html-quote-start html)))
+    (if (not i)
+        html
+        (let ((head (substring html 0 i)))
+          (string-append head
+                         (nm--quote-details (nm--html-blank? head)
+                                            (substring html i (string-length html))))))))
+
+(define (nm--quote-line? line)
+  (or (string-prefix? ">" line)
+      (re-match? "^On .+ wrote:\\s*$" line)
+      (string-prefix? "-----Original" line)
+      (string-prefix? "________________________________" line)))
+
+;; a text body as html, with the history from the first quote line folded
+(define (nm--fold-text-quote text)
+  (let loop ((ls (string-split text "\n")) (head '()))
+    (cond ((null? ls)
+           (html-escape text))
+          ((nm--quote-line? (car ls))
+           (let ((h (string-join (reverse head) "\n")))
+             (string-append (html-escape h)
+                            (nm--quote-details (string=? (string-trim h) "")
+                                               (html-escape (string-join ls "\n"))))))
+          (else (loop (cdr ls) (cons (car ls) head))))))
+
 (define (nm--msg-html msg)
   (let* ((h (plist-get msg 'headers))
-         (html (nm--parts-html (plist-get msg 'body)))
-         (body (or html
+         (raw (nm--parts-html (plist-get msg 'body)))
+         (html (and raw (nm--inline-cids msg raw)))
+         (body (if html
+                   (nm--fold-html-quote html)
                    (string-append "<pre style=\"white-space:pre-wrap;font:inherit\">"
-                                  (html-escape (nm--parts-text (plist-get msg 'body)))
+                                  (nm--fold-text-quote (nm--parts-text (plist-get msg 'body)))
                                   "</pre>"))))
     ;; a newline before each message: it starts a line of its own, where
     ;; imenu's jump to the line lands inside it
@@ -2469,7 +2684,7 @@ them the address is live, so a purge never follows one."
       "<mail-date>" (html-escape (or (plist-get h 'Date) "")) "</mail-date>"
       (let ((to (plist-get h 'To)))
         (if to (string-append " · to <mail-to>" (html-escape to) "</mail-to>") ""))
-      "</header>" (nm--attachment-html msg) "<mail-body>" body "</mail-body></mail-message>")))
+      "</header><mail-body>" body "</mail-body>" (nm--attachment-html msg raw) "</mail-message>")))
 
 (define (nm--msg-anchor-name msg)
   ;; a message's name in both views: the id of its <mail-message> in the
@@ -2497,6 +2712,17 @@ them the address is live, so a purge never follows one."
     "</title><style>mail-thread,mail-message,mail-body,mail-attachments,mail-attachment{display:block}"
     "mail-message>header{border-top:1px solid #d0c8b8;margin-top:14px;padding:6px 0;font:12px system-ui;color:#666}"
     "mail-from{font-weight:bold}"
+    "details.mail-quoted{margin:8px 0}"
+    "details.mail-quoted>summary{cursor:pointer;color:#888;font:12px system-ui;list-style:none}"
+    "mail-attachments{margin:14px 0 4px;padding:10px 12px;border:1px solid #d0c8b8;border-radius:8px;font:12px system-ui}"
+    "mail-attachments>strong{display:block;margin-bottom:8px}"
+    "mail-attachments>small{display:block;margin-top:8px;color:#888}"
+    "mail-attachment{display:inline-block;vertical-align:top;max-width:160px;margin:0 10px 6px 0;word-break:break-all}"
+    "mail-attachment img{display:block;max-width:160px;max-height:160px;border-radius:4px;margin-bottom:4px}"
+    ;; a file that is not an image is its icon, then its name, which wraps
+    ;; only where the pane runs out of room
+    "mail-attachment:has(.mail-file-icon){display:inline-flex;align-items:center;gap:6px;max-width:100%;word-break:normal;overflow-wrap:anywhere}"
+    "i.mail-file-icon{flex:none;font:normal 22px/1 'Symbols Nerd Font Mono','JetBrainsMonoNL Nerd Font Mono','JetBrainsMono Nerd Font Mono','Hack Nerd Font Mono';color:#a83a2b}"
     ;; the title of the thread, and it reads as one: bold, full contrast,
     ;; and clear of the first message's header rule
     "mail-subject{display:block;font:700 21px/1.3 system-ui;"
@@ -2643,6 +2869,13 @@ them the address is live, so a purge never follows one."
                 (begin
                   (buffer-set-local! buf 'render-mode "html")
                   (nm--show-html! buf subject msgs)
+                  ;; image attachments draw as thumbnails once they are made
+                  (nm--make-thumbs! msgs
+                    (lambda ()
+                      (when (and (buffer-known? buf)
+                                 (equal? (buffer-local-value 'notmuch-thread buf) th)
+                                 (equal? (buffer-local-value 'render-mode buf) "html"))
+                        (nm--show-html! buf subject msgs))))
                   ;; authored colors assume a white canvas — by default the
                   ;; theme repaints the document instead (dark mode stays
                   ;; readable); customize notmuch-html-original-colors to
