@@ -45,7 +45,7 @@ anything else is an ssh destination."
   'group 'notmuch)
 
 (defcustom 'notmuch-mailboxes '(("" ""))
-  "The mailboxes notmuch-switch-host offers, each (HOST PROFILE); empty host is this machine."
+  "The mailboxes notmuch-switch-host offers, each (HOST PROFILE); empty host is this machine. (gmail ADDRESS) reads a connected Google account through the Gmail API."
   'group 'notmuch)
 
 (defcustom 'notmuch-ssh-program
@@ -331,8 +331,24 @@ when a message has no text/plain part." 'group 'notmuch)
 (define (nm--mailbox-kind mailbox)
   (if (and (pair? mailbox) (symbol? (car mailbox))) (car mailbox) 'notmuch))
 
+;; The chosen mailbox. notmuch-host holds "KIND:ARG" for a mailbox of a
+;; registered backend other than notmuch, e.g. "gmail:me@example.com".
 (define (nm--current-mailbox)
-  (list notmuch-host notmuch-profile))
+  (nm--pair->mailbox notmuch-host notmuch-profile))
+
+(define (nm--pair->mailbox host profile)
+  (let* ((m (and (string? host) (re-match "^([a-z]+):(.+)$" host)))
+         (kind (and m (string->symbol (cadr m)))))
+    (if (and kind (not (eq? kind 'notmuch)) (assq kind *mail-backends*))
+        (list kind (caddr m))
+        (list host profile))))
+
+;; An entry of notmuch-mailboxes as the (HOST PROFILE) strings the chosen
+;; mailbox is kept in: (gmail "me@example.com") is ("gmail:me@example.com" "").
+(define (nm--entry->pair entry)
+  (if (symbol? (car entry))
+      (list (string-append (symbol->string (car entry)) ":" (cadr entry)) "")
+      entry))
 
 (define (nm--backend &optional mailbox)
   (let* ((kind (nm--mailbox-kind (or mailbox (nm--current-mailbox))))
@@ -978,11 +994,11 @@ mail-threads mail-thread[marked=true]:not(.selected) {
   (lambda ()
     (let ((buf (current-buffer)))
       (minibuffer-read "Mailbox: "
-        (map (lambda (m) (nm--mailbox-label (car m) (cadr m))) notmuch-mailboxes)
+        (map (lambda (m) (nm--mailbox-label (car m) (cadr m))) (map nm--entry->pair notmuch-mailboxes))
         (lambda (choice)
           (let* ((typed (string-trim choice))
                  (hit (filter (lambda (m) (equal? (nm--mailbox-label (car m) (cadr m)) typed))
-                              notmuch-mailboxes))
+                              (map nm--entry->pair notmuch-mailboxes)))
                  (host (if (null? hit)
                            (if (equal? typed "local") "" typed)
                            (car (car hit))))
@@ -1053,9 +1069,12 @@ mail-threads mail-thread[marked=true]:not(.selected) {
   (let* ((buf *notmuch-search-buffer*)
          (existed? (buffer-exists? buf)))
     (when profile
-      (let ((box (filter (lambda (m) (equal? (cadr m) profile)) notmuch-mailboxes)))
-        (unless (null? box) (set! notmuch-host (car (car box)))))
-      (set! notmuch-profile profile)
+      (let ((box (filter (lambda (m) (or (equal? (cadr m) profile) (equal? (car m) profile)))
+                         (map nm--entry->pair notmuch-mailboxes))))
+        (if (null? box)
+            (set! notmuch-profile profile)
+            (begin (set! notmuch-host (car (car box)))
+                   (set! notmuch-profile (cadr (car box))))))
       (set! *nm-db-paths* '())
       (for-each (lambda (b)
                   (when (buffer-exists? b)
@@ -2044,7 +2063,7 @@ carries a tag outside notmuch-autotag-exclude. C-u notmuch-autotag takes them al
 (define (nm--host-cmd script)
   "SCRIPT as a command line that runs where the mail store lives: over ssh when
 notmuch-host names another machine, here when it is empty."
-  (if (equal? notmuch-host "")
+  (if (or (equal? notmuch-host "") (symbol? (car (nm--current-mailbox))))
       script
       (string-append notmuch-ssh-program " " (sh-quote notmuch-host) " " (sh-quote script))))
 
@@ -3327,8 +3346,28 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
                         files))
             "\n--" boundary "--\n")))))
 
+;; The mailbox of notmuch-mailboxes whose backend sends mail itself and
+;; whose address is TEXT's From, or #f.
+(define (nm--send-mailbox text)
+  (let ((from (string-downcase (nm--from-header text))))
+    (let loop ((ms (map nm--entry->pair notmuch-mailboxes)))
+      (if (null? ms)
+          #f
+          (let ((mb (nm--pair->mailbox (car (car ms)) (cadr (car ms)))))
+            (if (and (symbol? (car mb))
+                     (nm--backend-has? 'send mb)
+                     (string-contains? from (string-downcase (cadr mb))))
+                mb
+                (loop (cdr ms))))))))
+
 (define (mail-send-text! text)
-  "(mail-send-text! TEXT) — send the RFC 822 TEXT through the route its From picks; #t when sent, else the error as a string"
+  "(mail-send-text! TEXT) — send the RFC 822 TEXT through the mailbox or route its From picks; #t when sent, else the error as a string"
+  (let ((mb (nm--send-mailbox text)))
+    (if mb
+        (nm--op-on mb 'send text)
+        (nm--send-by-route text))))
+
+(define (nm--send-by-route text)
   (let ((route (nm--send-route text))
         (tmp (string-append (expand-path "~") "/.compos/outgoing.eml")))
     (if (not route)
@@ -3551,7 +3590,7 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
   'group 'notmuch 'type 'string)
 
 (defcustom 'mail-feed-profiles '("svs.io" "recruiting" "vidura")
-  "The notmuch profiles the feed reads, one per mailbox."
+  "The notmuch profiles the feed reads, one per mailbox. \"gmail:ADDRESS\" reads that Gmail account; mail-feed-gmail-seconds paces it."
   'group 'notmuch 'type 'list)
 
 (defcustom 'mail-feed-sweep-seconds 900
@@ -3593,8 +3632,9 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
                 'tags tags))))
 
 (define (mail-feed--mailbox profile)
-  "(mail-feed--mailbox PROFILE) — the mailbox (HOST PROFILE) the feed reads for PROFILE"
-  (list mail-feed-host profile))
+  "(mail-feed--mailbox PROFILE) — the mailbox the feed reads for PROFILE: (HOST PROFILE), or (gmail ADDRESS) for a PROFILE \"gmail:ADDRESS\""
+  (let ((mb (nm--pair->mailbox profile "")))
+    (if (symbol? (car mb)) mb (list mail-feed-host profile))))
 
 (effects! '(write))
 
@@ -3663,16 +3703,33 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
   (debounce! 'mail-feed-sweep (* 1000 mail-feed-sweep-seconds)
              (lambda (x) (mail-feed--tick x)) #f))
 
+(defcustom 'mail-feed-gmail-seconds 30
+  "Seconds between two looks at the Gmail mailboxes of mail-feed-profiles. Gmail
+pushes nothing here, so this is how soon its new mail becomes an event; a
+look with nothing new costs one history.list call."
+  'group 'notmuch 'type 'integer)
+
+(define (mail-feed--gmail-profiles)
+  (filter (lambda (p) (symbol? (car (mail-feed--mailbox p)))) mail-feed-profiles))
+
+(define (mail-feed--gmail-tick _)
+  (report-errors "mail-feed: gmail" (lambda () (for-each mail-feed--sweep-one! (mail-feed--gmail-profiles))))
+  (unless (null? (mail-feed--gmail-profiles))
+    (debounce! 'mail-feed-gmail (* 1000 mail-feed-gmail-seconds)
+               (lambda (x) (mail-feed--gmail-tick x)) #f)))
+
 (define (mail-feed-start!)
-  "(mail-feed-start!) — take the mail host's pushes and start the sweep"
+  "(mail-feed-start!) — take the mail host's pushes and start the sweeps"
   (event-feed-route! "/mail" (lambda (request) (mail-feed--handle request)))
   (event-feed-start!)
-  (mail-feed--tick #f))
+  (mail-feed--tick #f)
+  (mail-feed--gmail-tick #f))
 
 (define (mail-feed-stop!)
   "(mail-feed-stop!) — stop taking the mail host's pushes and stop the sweep"
   (set! *event-feed-routes* (events--without "/mail" *event-feed-routes*))
-  (debounce-cancel! 'mail-feed-sweep))
+  (debounce-cancel! 'mail-feed-sweep)
+  (debounce-cancel! 'mail-feed-gmail))
 
 (define-command "mail-feed-start" "Turn new mail into events: the webhook and the sweep"
   (lambda () (mail-feed-start!) (message "Mail feed on")))
@@ -3731,3 +3788,6 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
   '(notmuch mail-tag!))
 (for-each (lambda (n) (catalog-meta! 'function (symbol->string n) 'effects '(write display)))
   '(mail-open!))
+
+;; the Gmail backend: a mailbox (gmail ADDRESS) reads that Google account
+(require 'notmuch-gmail)
