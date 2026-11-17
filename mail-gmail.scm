@@ -1,15 +1,16 @@
-;;; notmuch-gmail.scm --- the Gmail backend of the mail UI.
+;;; mail-gmail.scm --- the Gmail backend of the mail UI.
 ;;;
 ;;; A mailbox (gmail "me@example.com") reads, tags and sends that Google
 ;;; account's mail through the Gmail API, with the account the google
 ;;; package connected. It answers every operation of the notmuch backend
-;;; (see "mail backends" in notmuch.scm) in the same shapes, so the mail UI
+;;; (see "mail backends" in mail.scm) in the same shapes, so the mail UI
 ;;; does not know which one it reads:
 ;;;
 ;;;   tags are labels: inbox INBOX, unread UNREAD, sent SENT, draft DRAFT,
-;;;   spam SPAM, trash TRASH, flagged STARRED, important IMPORTANT; any
-;;;   other tag is the user label of that name, made the first time a
-;;;   thread is given it. Gmail's categories stay hidden.
+;;;   spam SPAM, trash TRASH, flagged STARRED, important IMPORTANT, and
+;;;   the categories promotions, social, forums and updates; any other
+;;;   tag is the user label of that name, made the first time a thread is
+;;;   given it.
 ;;;   queries are notmuch queries, translated to Gmail search: tag:, from:,
 ;;;   to:, subject:, id:, date:, and, or, not and parentheses. thread:ID
 ;;;   picks threads by id. What has no Gmail form (lastmod:, folder:,
@@ -74,7 +75,9 @@
 
 (define gm--system-tags
   '(("INBOX" "inbox") ("UNREAD" "unread") ("SENT" "sent") ("DRAFT" "draft")
-    ("SPAM" "spam") ("TRASH" "trash") ("STARRED" "flagged") ("IMPORTANT" "important")))
+    ("SPAM" "spam") ("TRASH" "trash") ("STARRED" "flagged") ("IMPORTANT" "important")
+    ("CATEGORY_PROMOTIONS" "promotions") ("CATEGORY_SOCIAL" "social")
+    ("CATEGORY_FORUMS" "forums") ("CATEGORY_UPDATES" "updates")))
 
 (define (gm--labels mb)
   (let ((hit (assoc (gm--email mb) *gm-labels*)))
@@ -136,7 +139,9 @@
 (define (gm--tag-term tag)
   (let ((sys (assoc tag '(("inbox" "in:inbox") ("unread" "is:unread") ("sent" "in:sent")
                           ("draft" "in:draft") ("spam" "in:spam") ("trash" "in:trash")
-                          ("deleted" "in:trash") ("flagged" "is:starred") ("important" "is:important")))))
+                          ("deleted" "in:trash") ("flagged" "is:starred") ("important" "is:important")
+                          ("promotions" "category:promotions") ("social" "category:social")
+                          ("forums" "category:forums") ("updates" "category:updates")))))
     (cond (sys (cadr sys))
           ((string-prefix? "/" tag) #f)
           (else (string-append "label:" (string-map (lambda (c) (if (memv c '(#\space #\/)) #\- c)) tag))))))
