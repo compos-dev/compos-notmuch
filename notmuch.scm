@@ -2544,8 +2544,50 @@ them the address is live, so a purge never follows one."
           ((nm--parts-html (plist-get (car ms) 'body)) #t)
           (else (loop (cdr ms))))))
 
+;; imenu: one row per message of the thread, the sender and the date.
+;; The text view jumps to the message's line; the html view is an iframe
+;; with no point, so its row scrolls the iframe to that <mail-message>.
+(define (nm--imenu-sender from)
+  (let ((name (string-trim (car (string-split from "<")))))
+    (string-trim (re-replace-all "\"" (if (equal? name "") from name) ""))))
+
+(define (nm--imenu-date date)
+  ;; "Mon, 19 Oct 2026 23:40:22 +0530" -> "19 Oct 2026 23:40"
+  (let* ((s (let ((p (string-split date ", "))) (if (pair? (cdr p)) (cadr p) date)))
+         (w (string-split s " ")))
+    (if (>= (length w) 4)
+        (string-append (list-ref w 0) " " (list-ref w 1) " " (list-ref w 2) " "
+                       (let ((t (list-ref w 3))) (if (> (string-length t) 5) (substring t 0 5) t)))
+        date)))
+
+(define (nm--imenu-scroll! buf i)
+  (for-each
+    (lambda (w)
+      (when (equal? (window-buffer w) buf)
+        (dom-eval (string-append
+          "(function(){var f=document.getElementById('prev-" (number->string w) "');"
+          "var d=f&&f.contentDocument;var m=d&&d.querySelectorAll('mail-message')[" (number->string i) "];"
+          "if(m)m.scrollIntoView({block:'start'});return !!m})()"))))
+    (map car (window-list))))
+
+(define (nm--show-imenu-rows buf)
+  (let ((offs (or (buffer-local-value 'notmuch-msgs buf) '()))
+        (heads (or (buffer-local-value 'notmuch-msg-heads buf) '()))
+        (html? (equal? (buffer-local-value 'render-mode buf) "html")))
+    (let loop ((os offs) (hs heads) (i 0) (out '()))
+      (if (or (null? os) (null? hs))
+          (reverse out)
+          (let* ((from (car (car hs))) (date (cadr (car hs))))
+            (loop (cdr os) (cdr hs) (+ i 1)
+              (cons (list (if html? 1 (with-current-buffer buf (lambda () (line-number-at-pos (+ (car (car os)) 1)))))
+                          "message"
+                          (string-append (number->string (+ i 1)) ". " (nm--imenu-sender from) " · " (nm--imenu-date date))
+                          (string-append from " · " date)
+                          (and html? (let ((n i)) (lambda () (nm--imenu-scroll! buf n)))))
+                    out)))))))
+
 (mode-doc! "notmuch-show-mode"
-  "One mail thread, read. `a` archives it, `L` files it for the agent (+liked -inbox) and `r` starts a reply. `C-c a` opens an attachment. `v` changes between HTML and plain text. `q` goes back to the search.")
+  "One mail thread, read. `a` archives it, `L` files it for the agent (+liked -inbox) and `r` starts a reply. `C-c a` opens an attachment. `v` changes between HTML and plain text. imenu (`M-g i`) jumps to a message of the thread. `q` goes back to the search.")
 
 (mode-icon! "notmuch-show-mode" "")
 
@@ -2566,6 +2608,11 @@ them the address is live, so a purge never follows one."
             (desktop-skip! buf 'nm-attachment-source)
             (buffer-set-local! buf 'notmuch-attachments (nm--attachment-options msgs))
             (buffer-set-local! buf 'nm-attachment-source (nm--db-key))
+            (buffer-set-local! buf 'notmuch-msg-heads
+              (map (lambda (m) (let ((h (plist-get m 'headers)))
+                                 (list (or (plist-get h 'From) "") (or (plist-get h 'Date) ""))))
+                   msgs))
+            (buffer-set-local! buf 'imenu-index-function 'nm--show-imenu-rows)
             (buffer-delete-range! buf 0 (buffer-size buf))
             (if html?
                 (begin
