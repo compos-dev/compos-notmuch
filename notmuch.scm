@@ -318,6 +318,19 @@ when a message has no text/plain part." 'group 'notmuch)
 (defface! 'nm-subject 'fg "color-mix(in srgb, var(--default-fg) 78%, var(--default-bg))")
 (defface! 'nm-tags 'fg "#64603a")
 (defface! 'nm-marked 'fg "#a03020" 'weight "700")
+
+;; A marked thread wears a bar and a tint, so a selection reads at a glance
+;; in the block view. The tint skips the cursor's row, so the cursor's own
+;; background still shows on a marked row and you can tell where you are.
+(define-style! 'notmuch-marked-rows "
+mail-threads > .semantic-direct[marked=true],
+mail-threads mail-thread[marked=true] {
+  box-shadow: inset 4px 0 var(--accent-fg, #e37170);
+}
+mail-threads mail-thread[marked=true]:not(.selected) {
+  background-color: color-mix(in srgb, var(--accent-fg, #e37170) 18%, transparent);
+}
+")
 (defface! 'nm-bar 'fg "#26356b")
 
 (define (nm--search-json query limit)
