@@ -231,6 +231,35 @@
     (check-equal! (buffer-local-value 'render-mode (current-buffer)) "html" "and back again")
     (t--nm-done!)))
 
+(deftest 'a-thread-names-each-message-as-an-anchor-in-both-views
+  "each message is an anchor named message:ID over its own bytes; in html it is the id of its element"
+  (lambda ()
+    (t--nm-setup!)
+    (run-command "notmuch-inbox")
+    (t--nm-run! "notmuch-next")
+    (t--nm-run! "notmuch-open-thread")
+    (let* ((buf (current-buffer)) (as (anchor-list buf)) (text (buffer-text buf)))
+      (check-equal! (buffer-local-value 'render-mode buf) "html" "the html view")
+      (check-equal! (map anchor-name as) '("message:m2") "one anchor, named by the message id")
+      (check-true! (string-prefix? "<mail-message id=\"message:m2\""
+                                   (substring-bytes text (anchor-start (car as)) (string-byte-length text)))
+                   "it starts at the element whose id is its name")
+      (check-true! (string-suffix? "</mail-message>" (substring-bytes text 0 (anchor-end (car as))))
+                   "and ends with it")
+      (check-equal! (car (car (buffer-local-value 'notmuch-msgs buf))) (anchor-start (car as))
+                    "the message at point is found by its real offset")
+      (check-true! (minor-mode-on? buf "anchor-mode") "anchor-mode is on")
+      (check-equal! (map (lambda (r) (list (cadr r) (caddr r))) (nm--show-imenu-index buf))
+                    '(("message" "1. Bob · 06 Aug 2026 23:04"))
+                    "imenu names it by sender and date"))
+    (t--nm-run! "notmuch-show-toggle-view")
+    (let* ((buf (current-buffer)) (as (anchor-list buf)) (text (buffer-text buf)))
+      (check-equal! (map anchor-name as) '("message:m2") "the text view uses the same name")
+      (check-true! (string-prefix? "── message 1 of 1"
+                                   (substring-bytes text (anchor-start (car as)) (string-byte-length text)))
+                   "over the message's own lines"))
+    (t--nm-done!)))
+
 (deftest 'every-thread-opens-its-own-page
   "a list's rows are its pages: two threads read are two pages, and going back reuses the first"
   (lambda ()
