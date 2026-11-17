@@ -1009,6 +1009,8 @@ when a message has no text/plain part." 'group 'notmuch)
 ;; fetch reads the thread, and reading it clears unread again. The verb
 ;; says so once, here, and the next pass consumes it.
 (define *nm-skip-follow* #f)
+;; the thread at point the last time the pane followed it
+(define *nm-follow-id* #f)
 (define (nm--skip-follow!) (set! *nm-skip-follow* #t))
 
 ;; the thread the reader dismissed the pane on, or #f
@@ -1033,8 +1035,15 @@ when a message has no text/plain part." 'group 'notmuch)
       ;; the pane went some other way than q: that is a dismissal too
       ((and *notmuch-pane-shown* (not (find window-showing (nm--show-buffers))))
        (set! *nm-dismissed* (nm--id-at buf)))
-      ;; a highlight on its way somewhere else should not cost a fetch
-      ((not (nm--pane-at-point? buf)) (nm--preview-soon! buf)))))
+      ;; the pane follows point, not the other way round: only a move to
+      ;; another thread refills it. A pane the user walked to another mail
+      ;; (s-[ / s-], C-x b) while point stays put keeps that mail.
+      (else
+       (let ((id (nm--id-at buf)))
+         (cond ((nm--pane-at-point? buf) (set! *nm-follow-id* id))
+               ((equal? id *nm-follow-id*) #f)
+               (else (set! *nm-follow-id* id)
+                     (nm--preview-soon! buf))))))))
 
 (define (nm--id-at buf)
   (let ((th (nm--thread-at buf))) (and th (nm--th-id th))))
