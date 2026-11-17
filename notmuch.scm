@@ -225,7 +225,7 @@ when a message has no text/plain part." 'group 'notmuch)
   (let ((hit (assoc (nm--db-key) *nm-db-paths*)))
     (if hit
         (cadr hit)
-        (let ((path (string-trim (nm--run "config get database.path"))))
+        (let ((path (string-trim (nm--op 'config "database.path"))))
           ;; a failed lookup is not an answer: leave it uncached and retry
           (when (not (equal? path ""))
             (set! *nm-db-paths* (cons (list (nm--db-key) path) *nm-db-paths*)))
@@ -287,6 +287,152 @@ when a message has no text/plain part." 'group 'notmuch)
 (define (nm--json args)
   (json-parse (nm--run args)))
 
+;;; --- mail backends -----------------------------------------------------------
+;;; A mailbox names its backend. (HOST PROFILE), two strings, is a notmuch
+;;; database on HOST; (KIND ARG ...) with a symbol KIND names a registered
+;;; backend, e.g. (gmail "me@example.com"). The UI reads and writes mail only
+;;; through these operations, so it is the same over every backend. Each
+;;; operation takes the mailbox first (#f is the chosen one) and queries in
+;;; notmuch syntax; a backend translates what it can and filters the rest.
+;;;
+;;;   search MB QUERY LIMIT          threads as `search --format=json`
+;;;   show MB THREAD HTML?           the thread as `show --format=json`
+;;;   changed MB AFTER SINCE         messages changed after revision AFTER and
+;;;                                  dated after SINCE, as `show` with no bodies
+;;;   changed-threads MB AFTER SINCE REST
+;;;                                  thread lines changed after AFTER, REST a
+;;;                                  notmuch clause starting with " and "
+;;;   revision MB                    the change counter, a number or #f
+;;;   tag! MB CHANGES QUERY          CHANGES "+a -b" or a list of "+a" "-b"
+;;;   count MB QUERY                 messages matching, a number or #f
+;;;   count-batch MB QUERIES K       K gets one count per line, without blocking
+;;;   tags MB QUERY                  the tags on QUERY's messages; #f is all
+;;;   threads MB QUERY               "thread:ID" lines
+;;;   newest-message MB THREAD       the newest message id, or #f
+;;;   raw MB MSG-ID FILTER           the RFC 822 text through shell FILTER ("" none)
+;;;   part-command MB MSG-ID PART    a shell command that prints that part
+;;;   reply MB MSG-ID                reply headers and original, as `reply --format=json`
+;;;   config MB KEY                  a setting: user.name, user.primary_email,
+;;;                                  user.other_email, database.path
+;;;   saved-searches MB              ((NAME QUERY) ...)
+;;;   senders MB QUERY               "COUNT\tADDRESS" lines
+;;;   block-sender! MB ADDRESS       future mail from ADDRESS is junked on arrival
+;;;   send MB TEXT                   optional: send RFC 822 TEXT; #t or the error
+
+(define *mail-backends* '())
+
+(define (mail-backend-register! kind ops)
+  "(mail-backend-register! KIND OPS) — make KIND a mail backend; OPS is a plist of operation procedures"
+  (set! *mail-backends*
+        (cons (cons kind ops)
+              (filter (lambda (b) (not (eq? (car b) kind))) *mail-backends*)))
+  kind)
+
+(define (nm--mailbox-kind mailbox)
+  (if (and (pair? mailbox) (symbol? (car mailbox))) (car mailbox) 'notmuch))
+
+(define (nm--current-mailbox)
+  (list notmuch-host notmuch-profile))
+
+(define (nm--backend &optional mailbox)
+  (let* ((kind (nm--mailbox-kind (or mailbox (nm--current-mailbox))))
+         (hit (assq kind *mail-backends*)))
+    (if hit
+        (cdr hit)
+        (error (string-append "No mail backend " (symbol->string kind))))))
+
+(define (nm--backend-has? name &optional mailbox)
+  (and (plist-get (nm--backend mailbox) name) #t))
+
+;; (nm--op-on MAILBOX NAME ARG ...) runs operation NAME of MAILBOX's backend;
+;; (nm--op NAME ARG ...) runs it on the chosen mailbox.
+(define (nm--op-on mailbox name . args)
+  (let ((f (plist-get (nm--backend mailbox) name)))
+    (if f
+        (apply f mailbox args)
+        (error (string-append "This mailbox cannot " (symbol->string name))))))
+
+(define (nm--op name . args)
+  (apply nm--op-on #f name args))
+
+;; --- the notmuch backend: the notmuch CLI, here or over ssh
+
+(define (nm--lines s)
+  (filter (lambda (l) (not (equal? l ""))) (string-split (string-trim (or s "")) "\n")))
+
+;; a bare thread:ID or id:ID goes as it is; anything else is quoted
+(define (nm--q query)
+  (if (re-match? "^[A-Za-z0-9:._@+=-]+$" query) query (sh-quote query)))
+
+;; MB #f calls nm--run with one argument, so a stub of it sees the call it always did
+(define (nm--run-on mb args)
+  (if mb (nm--run args mb) (nm--run args)))
+
+(define (nm--json-on mb args)
+  (json-parse (nm--run-on mb args)))
+
+(define (nm--changes-text changes)
+  (if (string? changes) changes (string-join (map sh-quote changes) " ")))
+
+(define (nm--lastmod-of out)
+  (let ((f (string-split (string-trim out) "\t")))
+    (and (= (length f) 3) (string->number (caddr f)))))
+
+(mail-backend-register! 'notmuch
+  (list
+   'search (lambda (mb query limit)
+             (nm--json-on mb (string-append "search --format=json --limit="
+                                            (number->string limit) " -- " (sh-quote query))))
+   'show (lambda (mb thread html?)
+           (nm--json-on mb (string-append "show --format=json "
+                                          (if html? "--include-html" "--body=false")
+                                          " thread:" thread)))
+   'changed (lambda (mb after since)
+              (nm--json-on mb (string-append
+                               "show --format=json --body=false --entire-thread=false "
+                               (sh-quote (string-append "lastmod:" (number->string after) ".."
+                                                        " and date:@" (number->string since) "..")))))
+   'changed-threads (lambda (mb after since rest)
+                      (nm--lines (nm--run-on mb (string-append
+                                                 "search --output=threads -- "
+                                                 (sh-quote (string-append
+                                                            "lastmod:" (number->string after) ".."
+                                                            " and date:@" (number->string since) ".."
+                                                            rest))))))
+   'revision (lambda (mb) (nm--lastmod-of (nm--run-on mb "count --lastmod '*'")))
+   'tag! (lambda (mb changes query)
+           (nm--run-on mb (string-append "tag " (nm--changes-text changes) " -- " (nm--q query))))
+   'count (lambda (mb query)
+            (string->number (string-trim (nm--run-on mb (string-append "count -- " (sh-quote query))))))
+   'count-batch (lambda (mb queries k)
+                  (shell-command->string (nm--batch-count-command queries) k))
+   'tags (lambda (mb query)
+           (nm--lines (nm--run-on mb (if query
+                                         (string-append "search --output=tags -- " (nm--q query))
+                                         "search --output=tags --exclude=false -- '*'"))))
+   'threads (lambda (mb query)
+              (nm--lines (nm--run-on mb (string-append "search --output=threads -- " (sh-quote query)))))
+   'newest-message (lambda (mb thread)
+                     (let ((out (string-trim (nm--run-on mb (string-append
+                                                             "search --output=messages --limit=1 -- thread:" thread)))))
+                       (and (string-prefix? "id:" out) (substring out 3 (string-length out)))))
+   'raw (lambda (mb msg-id filter)
+          (nm--run-on mb (string-append "show --format=raw -- " (sh-quote (string-append "id:" msg-id))
+                                        (if (equal? filter "") "" (string-append " | " filter)))))
+   'part-command (lambda (mb msg-id part)
+                   (nm--cmd (string-append "show --format=raw --part=" (number->string part) " -- "
+                                           (sh-quote (string-append "id:" msg-id)))
+                            mb))
+   'reply (lambda (mb msg-id)
+            (nm--json-on mb (string-append "reply --format=json id:" (sh-quote msg-id))))
+   'config (lambda (mb key) (nm--run-on mb (string-append "config get " key)))
+   'saved-searches (lambda (mb) (nm--parse-saved-searches (nm--run-on mb "config list")))
+   'senders (lambda (mb query)
+              (nm--run-on mb (string-append
+                              "address --output=sender --output=count --deduplicate=address -- "
+                              (sh-quote query))))
+   'block-sender! (lambda (mb email) (nm--block-sender! email))))
+
 
 (define (nm--fit s n)
   (let ((s (or s "")))
@@ -334,9 +480,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
 (defface! 'nm-bar 'fg "#26356b")
 
 (define (nm--search-json query limit)
-  (or (nm--json (string-append "search --format=json --limit="
-                               (number->string limit) " -- " (sh-quote query)))
-      '()))
+  (or (nm--op 'search query limit) '()))
 
 ;; stored per row: (thread-id subject authors tags date)
 (define (nm--th-id th) (car th))
@@ -443,8 +587,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
         (cadr hit)
         ;; count, and not count --output=threads: grouping threads over a
         ;; large query costs seconds
-        (let ((n (string-trim
-                   (nm--run (string-append "count -- " (sh-quote query))))))
+        (let ((n (let ((c (nm--op 'count query))) (if c (number->string c) ""))))
           (buffer-set-local! buf 'nm-count (list key n))
           n))))
 
@@ -618,7 +761,10 @@ mail-threads mail-thread[marked=true]:not(.selected) {
 
 ;; query.NAME.query=Q entries from the notmuch config
 (define (nm--saved-searches)
-  (let loop ((ls (string-split (nm--run "config list") "\n")) (acc '()))
+  (nm--op 'saved-searches))
+
+(define (nm--parse-saved-searches config-list)
+  (let loop ((ls (string-split config-list "\n")) (acc '()))
     (if (null? ls)
         (reverse acc)
         (let ((line (car ls)))
@@ -690,8 +836,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
     (buffer-set-local! buf 'nm-hello-status
       (if (null? searches) "" " · loading counts…"))
     (unless (null? searches)
-      (shell-command->string
-        (nm--batch-count-command (nm--hello-count-queries searches))
+      (nm--op 'count-batch (nm--hello-count-queries searches)
         (lambda (output)
           ;; An older refresh, another account, or a recreated buffer must
           ;; never receive these results. The callback never selects a window.
@@ -967,7 +1112,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
         (nm--show-pane! mail buf)
         (set! *notmuch-pane-shown* #t))
       ;; Keep the list focused before a database write can fail.
-      (nm--run (string-append "tag -unread -- thread:" (nm--th-id th)))
+      (nm--op 'tag! "-unread" (string-append "thread:" (nm--th-id th)))
       ;; opening marked it read — show that in the index right away
       (when (member "unread" (nm--th-tags th))
         (nm--refresh! buf)))))
@@ -1169,7 +1314,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
   (let ((th (nm--thread-at buf)) (pos (nm--position-of buf)))
     (if th
         (begin
-          (nm--run (string-append "tag " changes " -- thread:" (nm--th-id th)))
+          (nm--op 'tag! changes (string-append "thread:" (nm--th-id th)))
           (nm--after-change! buf pos)
           (message
             (if (and (equal? changes "-inbox")
@@ -1235,17 +1380,13 @@ mail-threads mail-thread[marked=true]:not(.selected) {
 ;; every tag in the database — the completion source for +
 (define (nm--all-tags)
   (filter (lambda (t) (not (equal? t "")))
-          (string-split (string-trim (nm--run "search --output=tags --exclude=false -- '*'")) "\n")))
+          (nm--op 'tags #f)))
 
 ;; Only offer tags that occur in the current result. The menu cannot lead
 ;; from a useful inbox view to an empty result through an unrelated tag.
 (define (nm--query-tags buf)
   (filter (lambda (t) (not (equal? t "")))
-          (string-split
-            (string-trim
-              (nm--run (string-append "search --output=tags -- "
-                                      (sh-quote (nm--query-of buf)))))
-            "\n")))
+          (nm--op 'tags (nm--query-of buf))))
 
 (define-command "notmuch-add-tag" "Add a tag to marked threads, or the thread at point (completes)"
   (lambda ()
@@ -1385,9 +1526,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
 
 (define (nm--thread-tags id)
   (filter (lambda (t) (not (equal? t "")))
-    (string-split
-      (string-trim (nm--run (string-append "search --output=tags -- thread:" id)))
-      "\n")))
+    (nm--op 'tags (string-append "thread:" id))))
 
 (define (nm--uniq lst)
   (let loop ((l lst) (acc '()))
@@ -1470,15 +1609,10 @@ carries a tag outside notmuch-autotag-exclude. C-u notmuch-autotag takes them al
           ((and th (or all (not notmuch-autotag-only-unprocessed))) (list (nm--th-id th)))
           (else
            (map nm--autotag-thread-id
-                (filter (lambda (l) (not (equal? l "")))
-                  (string-split
-                    (string-trim
-                      (nm--run (string-append "search --output=threads -- "
-                                 (sh-quote (string-append "(" base ")"
-                                             (if (or all (not notmuch-autotag-only-unprocessed))
-                                                 ""
-                                                 (nm--autotag-unprocessed-clause)))))))
-                    "\n")))))))
+                (nm--op 'threads (string-append "(" base ")"
+                                   (if (or all (not notmuch-autotag-only-unprocessed))
+                                       ""
+                                       (nm--autotag-unprocessed-clause)))))))))
 
 (define (nm--autotag-flag-key i)
   (string->symbol (string-append "f" (number->string i))))
@@ -1562,9 +1696,7 @@ carries a tag outside notmuch-autotag-exclude. C-u notmuch-autotag takes them al
                       (map (lambda (t) (string-append "-" t)) drop)
                       (if archive? '("-inbox") '()))))
     (unless (null? ops)
-      (nm--run (string-append "tag "
-                 (string-join (map sh-quote ops) " ")
-                 " -- thread:" id)))
+      (nm--op 'tag! ops (string-append "thread:" id)))
     ops))
 
 ;; notmuch's json carries only From/To/Cc/Subject/Date, and the delivery axis
@@ -1588,8 +1720,8 @@ carries a tag outside notmuch-autotag-exclude. C-u notmuch-autotag takes them al
     (set! nm--autotag-my-addresses
           (filter (lambda (s) (not (equal? s "")))
                   (map string-trim
-                       (append (string-split (nm--run "config get user.primary_email") "\n")
-                               (string-split (nm--run "config get user.other_email") "\n"))))))
+                       (append (string-split (nm--op 'config "user.primary_email") "\n")
+                               (string-split (nm--op 'config "user.other_email") "\n"))))))
   nm--autotag-my-addresses)
 
 (define (nm--autotag-header-text msg-id)
@@ -1598,9 +1730,7 @@ carries a tag outside notmuch-autotag-exclude. C-u notmuch-autotag takes them al
                 "{p=(tolower($0) ~ /^(" (string-join notmuch-autotag-headers "|")
                 "):/); if(p)print}")))
     (string-trim
-      (nm--run (string-append
-                 "show --format=raw -- " (sh-quote (string-append "id:" msg-id))
-                 " | awk " (sh-quote prog))))))
+      (nm--op 'raw msg-id (string-append "awk " (sh-quote prog))))))
 
 (define (nm--autotag-header-block id)
   (let* ((all (nm--show-msgs id))
@@ -1726,26 +1856,19 @@ carries a tag outside notmuch-autotag-exclude. C-u notmuch-autotag takes them al
 
 (define (nm--autotag-revision)
   ;; Blocks on the mail host: call it from a task.
-  (let ((f (string-split (string-trim (nm--run "count --lastmod '*'")) "\t")))
-    (and (= (length f) 3) (string->number (caddr f)))))
+  (nm--op 'revision))
 
 (define (nm--autotag-new-ids after since)
   ;; Blocks on the mail host: call it from a task.
   (filter (lambda (l) (not (equal? l "")))
           (map nm--autotag-thread-id
-               (string-split
-                (string-trim
-                 (nm--run (string-append
-                           "search --output=threads -- "
-                           (sh-quote (string-append
-                                      "lastmod:" (number->string (+ after 1)) ".."
-                                      " and date:@" (number->string (- since 86400)) ".."
-                                      " and not tag:sent and not tag:draft"
-                                      " and not tag:spam and not tag:trash"
-                                      (if notmuch-autotag-only-unprocessed
-                                          (nm--autotag-unprocessed-clause)
-                                          ""))))))
-                "\n"))))
+               (nm--op 'changed-threads (+ after 1) (- since 86400)
+                       (string-append
+                        " and not tag:sent and not tag:draft"
+                        " and not tag:spam and not tag:trash"
+                        (if notmuch-autotag-only-unprocessed
+                            (nm--autotag-unprocessed-clause)
+                            ""))))))
 
 (define (nm--autotag-new-save! rev now)
   (event-log-position-set! (nm--autotag-new-key) rev)
@@ -1906,7 +2029,7 @@ carries a tag outside notmuch-autotag-exclude. C-u notmuch-autotag takes them al
 (define (nm--thread-sender thread-id)
   "The bare address of the thread's first message, or an empty string."
   (let* ((msgs (nm--flatten-msgs
-                 (or (nm--json (string-append "show --format=json --body=false thread:" thread-id))
+                 (or (nm--op 'show thread-id #f)
                      '())))
          (from (if (null? msgs)
                    ""
@@ -1941,8 +2064,8 @@ notmuch-host names another machine, here when it is empty."
   "Trash every message from TARGET, an address or a whole domain, block it, and
 refresh the index. Answers how many matched."
   (let ((n (nm--count (string-append "from:" target))))
-    (nm--run (string-append "tag +trash +blocked -inbox -unread -- " (sh-quote (string-append "from:" target))))
-    (nm--block-sender! target)
+    (nm--op 'tag! "+trash +blocked -inbox -unread" (string-append "from:" target))
+    (nm--op 'block-sender! target)
     (nm--after-change! *notmuch-search-buffer*)
     n))
 
@@ -1979,12 +2102,8 @@ refresh the index. Answers how many matched."
 ;; to look like =XX escapes. Read them raw; only the body fallback below
 ;; needs QP decoding, and only as a last resort for senders with no header.
 (define (nm--unsubscribe-header-links msg-id)
-  (let* ((hdr (string-trim (nm--run (string-append
-                 "show --format=raw -- " (sh-quote (string-append "id:" msg-id))
-                 " | grep -i '^list-unsubscribe:' | head -1"))))
-         (post (string-trim (nm--run (string-append
-                 "show --format=raw -- " (sh-quote (string-append "id:" msg-id))
-                 " | grep -i '^list-unsubscribe-post:' | head -1"))))
+  (let* ((hdr (string-trim (nm--op 'raw msg-id "grep -i '^list-unsubscribe:' | head -1")))
+         (post (string-trim (nm--op 'raw msg-id "grep -i '^list-unsubscribe-post:' | head -1")))
          (https (let ((m (string-trim (shell-command->string
                     (string-append "printf '%s' " (sh-quote hdr)
                                    " | grep -oE '<https?://[^>]*>' | head -1")
@@ -2004,12 +2123,11 @@ refresh the index. Answers how many matched."
 ;; or nothing on an oddly-encoded message — acceptable as a fallback only.
 (define (nm--unsubscribe-body-link msg-id)
   (let* ((cmd (string-append
-                "show --format=raw -- " (sh-quote (string-append "id:" msg-id))
-                " | perl -MMIME::QuotedPrint -0777 -ne '"
+                "perl -MMIME::QuotedPrint -0777 -ne '"
                 "my $raw = $_; my $dec = eval { decode_qp($raw) }; $dec = $raw unless defined $dec; "
                 "if ($dec =~ /(https?:\\/\\/[^\\s\"\\x27<>]*unsubscribe[^\\s\"\\x27<>]*)/i) { print \"$1\\n\"; exit } "
                 "if ($raw =~ /(https?:\\/\\/[^\\s\"\\x27<>]*unsubscribe[^\\s\"\\x27<>]*)/i) { print \"$1\\n\"; exit }'"))
-         (out (string-trim (nm--run cmd))))
+         (out (string-trim (nm--op 'raw msg-id cmd))))
     (if (equal? out "") #f out)))
 
 (define (nm--curl-text url)
@@ -2102,7 +2220,7 @@ them the address is live, so a purge never follows one."
       (if (not thread-id)
           (message "No thread here")
           (let* ((msgs (nm--flatten-msgs
-                         (or (nm--json (string-append "show --format=json --body=false thread:" thread-id))
+                         (or (nm--op 'show thread-id #f)
                              '())))
                  (from (if (null? msgs)
                            ""
@@ -2131,7 +2249,7 @@ them the address is live, so a purge never follows one."
            (if (not th)
                (message "No thread here")
                (begin
-                 (nm--run (string-append "tag +liked -inbox -- thread:" th))
+                 (nm--op 'tag! "+liked -inbox" (string-append "thread:" th))
                  (when (buffer-exists? *notmuch-search-buffer*)
                    (nm--refresh! *notmuch-search-buffer*))
                  (message "Liked")))))
@@ -2190,16 +2308,13 @@ them the address is live, so a purge never follows one."
               (string-append (if (caddr s) " and not ( " " and ( ") threads " )"))))))
 
 (define (nm--marked-tags buf)
-  (filter (lambda (tag) (not (equal? tag "")))
-    (string-split (string-trim
-      (nm--run (string-append "search --output=tags -- " (sh-quote (nm--marked-query buf)))))
-      "\n")))
+  (nm--op 'tags (nm--marked-query buf)))
 
 (define (nm--tag-marked! buf changes)
   (if (not (nm--any-marked? buf))
       (message "No selected messages")
       (begin
-        (nm--run (string-append "tag " changes " -- " (sh-quote (nm--marked-query buf))))
+        (nm--op 'tag! changes (nm--marked-query buf))
         ;; Keep the local selection across the refresh. The selected thread IDs
         ;; remain valid even when their displayed tags change.
         (nm--after-change! buf))))
@@ -2365,9 +2480,7 @@ them the address is live, so a purge never follows one."
                                         (and (nm--image-part? p) (not (file-exists? out))
                                              (string-append
                                                "t=$(mktemp -d) && "
-                                               (nm--cmd (string-append "show --format=raw --part="
-                                                          (number->string (plist-get p 'id)) " -- "
-                                                          (sh-quote (string-append "id:" (plist-get msg 'id)))))
+                                               (nm--op 'part-command (plist-get msg 'id) (plist-get p 'id))
                                                " > \"$t/in\" && sips -s format jpeg -Z 320 \"$t/in\" --out \"$t/t.jpg\" >/dev/null 2>&1"
                                                " && base64 -i \"$t/t.jpg\" | tr -d '\\n' > " (sh-quote (string-append out ".part"))
                                                " && mv " (sh-quote (string-append out ".part")) " " (sh-quote out)
@@ -2386,9 +2499,7 @@ them the address is live, so a purge never follows one."
           (append acc
             (map (lambda (part)
                    (list (plist-get part 'filename)
-                         (nm--cmd (string-append "show --format=raw --part="
-                           (number->string (plist-get part 'id)) " -- "
-                           (sh-quote (string-append "id:" (plist-get msg 'id)))))))
+                         (nm--op 'part-command (plist-get msg 'id) (plist-get part 'id))))
                  (nm--attachment-parts (plist-get msg 'body)))))
         '() msgs))
 
@@ -2537,8 +2648,7 @@ else{var p=null;try{p=readline()}catch(e){}
 
 (define (nm--show-msgs thread-id)
   (let ((msgs (nm--flatten-msgs
-                (or (nm--json (string-append
-                                "show --format=json --include-html thread:" thread-id))
+                (or (nm--op 'show thread-id #t)
                     '()))))
     (if notmuch-show-newest-first (reverse msgs) msgs)))
 
@@ -2964,7 +3074,7 @@ else{var p=null;try{p=readline()}catch(e){}
       (buffer-set-local! buf 'nm-read-at (monotonic-ms)))
     ;; reading marks read, like every mail client
     (when (null? opts)
-      (nm--run (string-append "tag -unread -- thread:" thread-id)))
+      (nm--op 'tag! "-unread" (string-append "thread:" thread-id)))
     buf))
 
 (define-command "notmuch-open-thread" "Open the thread at point beside the index and go to it"
@@ -3002,7 +3112,7 @@ else{var p=null;try{p=readline()}catch(e){}
   (lambda ()
     (let ((th (buffer-local-value 'notmuch-thread (current-buffer))))
       (when th
-        (nm--run (string-append "tag -inbox -- thread:" th))
+        (nm--op 'tag! "-inbox" (string-append "thread:" th))
         (run-command "quit-window")
         (when (buffer-exists? *notmuch-search-buffer*)
           (nm--refresh! *notmuch-search-buffer*))
@@ -3064,7 +3174,7 @@ else{var p=null;try{p=readline()}catch(e){}
                       (else ovs)))))))
 
 (define (nm--compose-reply! msg-id)
-  (let* ((j (nm--json (string-append "reply --format=json id:" (sh-quote msg-id))))
+  (let* ((j (nm--op 'reply msg-id))
          (rh (and j (plist-get j 'reply-headers)))
          (orig (and j (plist-get j 'original))))
     (if (not rh)
@@ -3105,11 +3215,7 @@ else{var p=null;try{p=readline()}catch(e){}
 
 ;; newest message id of a thread (search sorts newest-first)
 (define (nm--newest-msg-id thread-id)
-  (let ((out (string-trim
-               (nm--run (string-append "search --output=messages --limit=1 -- thread:"
-                                       thread-id)))))
-    (and (string-prefix? "id:" out)
-         (substring out 3 (string-length out)))))
+  (nm--op 'newest-message thread-id))
 
 (define-command "notmuch-reply" "Reply to the newest message of the thread at point"
   (lambda ()
@@ -3175,8 +3281,8 @@ would let a word in the body pick the account the mail goes out from."
 
 (define (nm--default-from)
   "The From of the mailbox notmuch reads: its user.name and user.primary_email."
-  (let ((name (string-trim (notmuch "config get user.name")))
-        (email (string-trim (notmuch "config get user.primary_email"))))
+  (let ((name (string-trim (nm--op 'config "user.name")))
+        (email (string-trim (nm--op 'config "user.primary_email"))))
     (if (equal? name "") email (string-append name " <" email ">"))))
 
 (define (mail-message headers body &optional attachments)
@@ -3358,8 +3464,7 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
 ;; a parse failure reads as "no such thread" for one that exists: the
 ;; same blind-trust shape mail-tag! exists to fix, one level down.
 (define (nm--count query)
-  (string->number
-    (string-trim (nm--run (string-append "count -- " (sh-quote query))))))
+  (nm--op 'count query))
 
 (define (mail-tag! raw changes)
   (let* ((id (if (string-prefix? "thread:" raw)
@@ -3372,7 +3477,7 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
                       " — notmuch count gave an unexpected answer"))
       ((= n 0) (string-append "no such thread: " id))
       (else
-        (nm--run (string-append "tag " changes " -- thread:" id))
+        (nm--op 'tag! changes (string-append "thread:" id))
         (when (buffer-exists? *notmuch-search-buffer*)
           (nm--refresh! *notmuch-search-buffer*))
           (string-append "tagged " (number->string n) " message"
@@ -3380,9 +3485,7 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
                          " (" changes ")")))))
 
 (define (notmuch-sender-count query limit)
-  (let* ((raw (nm--run (string-append
-                "address --output=sender --output=count --deduplicate=address -- "
-                (sh-quote query))))
+  (let* ((raw (nm--op 'senders query))
          (lines (filter (lambda (l) (> (string-length l) 0)) (string-split raw "\n")))
          (rows (map (lambda (l)
                       (let ((parts (string-split l "\t")))
@@ -3524,9 +3627,7 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
 
 (define (mail-feed--revision profile)
   "(mail-feed--revision PROFILE) — the mailbox's lastmod revision, or #f; it blocks, so call it from a task"
-  (let ((f (string-split (string-trim (nm--run "count --lastmod '*'" (mail-feed--mailbox profile)))
-                         "\t")))
-    (and (= (length f) 3) (string->number (caddr f)))))
+  (nm--op-on (mail-feed--mailbox profile) 'revision))
 
 (define (mail-feed--sweep-one! profile)
   "(mail-feed--sweep-one! PROFILE) — read what changed in PROFILE after its saved revision and log what the log lacks. The first sweep only saves the revision."
@@ -3537,15 +3638,8 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
        (let ((rev (mail-feed--revision profile)))
          (list rev
                (and rev after since
-                    (json-parse
-                     (nm--run
-                      (string-append
-                       "show --format=json --body=false --entire-thread=false "
-                       (sh-quote (string-append
-                                  "lastmod:" (number->string after) ".."
-                                  " and date:@" (number->string (max since (- (current-time) 172800)))
-                                  "..")))
-                      (mail-feed--mailbox profile)))))))
+                    (nm--op-on (mail-feed--mailbox profile) 'changed
+                               after (max since (- (current-time) 172800)))))))
      (lambda (ok? value)
        (when (and ok? (car value))
          (let ((missed 0))
