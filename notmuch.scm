@@ -603,9 +603,11 @@ mail-threads mail-thread[marked=true]:not(.selected) {
     ;; current rows for its new base query.
     (when cached? (nm--refresh! buf))
     (list-goto-first-entry buf)
-    ;; a fresh index has shown no pane and dismissed nothing
+    ;; a fresh index has shown no pane, dismissed nothing and followed no
+    ;; row, so its first row previews even when it held the last one shown
     (set! *notmuch-pane-shown* #f)
-    (set! *nm-dismissed* #f)))
+    (set! *nm-dismissed* #f)
+    (set! *nm-follow-id* #f)))
 
 (define-command "notmuch-inbox" "Open the mail index on the default query"
   (lambda () (nm--open-index! notmuch-default-query)))
