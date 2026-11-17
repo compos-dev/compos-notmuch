@@ -286,9 +286,104 @@
                 (loop (plist-get j 'nextPageToken) acc)
                 acc))))))
 
-(define (gm--search mb query limit)
+(define (gm--search-now mb query limit)
   (let ((js (gm--pmap (lambda (p) (gm--thread-meta mb (car p) (cadr p))) (gm--list-threads mb query limit))))
     (map (lambda (j) (gm--thread-row mb j)) (filter (lambda (j) (and j (pair? (plist-get j 'messages)))) js))))
+
+;;; --- answers from the cache first
+;;;
+;;; Every Gmail request costs a round trip of a few hundred ms. A search or
+;;; count answers from its last result at once, and a task asks Gmail again
+;;; when the answer is older than gm-fresh-ms; a changed answer redraws the
+;;; index. Threads are fetched whole ahead of the highlight, so a move draws
+;;; from memory.
+
+(define gm-fresh-ms 5000)
+(define *gm-swr* '())   ; ((KEY TIME VALUE INFLIGHT) ...)
+
+(define (gm--swr-put! key time value inflight)
+  (set! *gm-swr* (cons (list key time value inflight)
+                       (filter (lambda (e) (not (equal? (car e) key))) *gm-swr*))))
+
+(define (gm--swr-set! key value inflight)
+  (gm--swr-put! key (monotonic-ms) value inflight))
+
+
+(define (gm--redraw-soon!)
+  (debounce! 'gm-redraw 50
+             (lambda (_)
+               (when (and (buffer-exists? *notmuch-search-buffer*)
+                          (symbol? (car (nm--current-mailbox))))
+                 (nm--refresh! *notmuch-search-buffer*)))
+             #f))
+
+(define (gm--swr key compute)
+  (let ((hit (assoc key *gm-swr*)))
+    (cond ((not hit)
+           (let ((v (compute))) (gm--swr-set! key v #f) v))
+          (else
+           (when (and (not (cadddr hit)) (> (- (monotonic-ms) (cadr hit)) gm-fresh-ms))
+             (gm--swr-put! key (cadr hit) (caddr hit) #t)
+             (task-run! compute
+                        (lambda (ok? v)
+                          (let ((old (caddr (or (assoc key *gm-swr*) hit))))
+                            (gm--swr-set! key (if ok? v old) #f)
+                            (when (and ok? (not (equal? v old))) (gm--redraw-soon!))))))
+           (caddr hit)))))
+
+;; the next answer for every cached search and count is Gmail's again
+(define (gm--swr-stale!)
+  (set! *gm-swr* (map (lambda (e) (list (car e) 0 (caddr e) (cadddr e))) *gm-swr*)))
+
+(define (gm--search mb query limit)
+  (let ((rows (gm--swr (list 'search (gm--email mb) query limit)
+                       (lambda () (gm--search-now mb query limit)))))
+    (gm--prefetch! mb (list-head (map (lambda (r) (plist-get r 'thread)) rows) (min 6 (length rows))))
+    (set! *gm-last-rows* (map (lambda (r) (plist-get r 'thread)) rows))
+    rows))
+
+;;; whole threads, by historyId
+
+(define *gm-full* '())        ; ((ID HISTORY-ID JSON) ...)
+(define *gm-last-rows* '())   ; thread ids of the last index, in order
+(define *gm-fetching* '())
+
+(define (gm--known-history id)
+  (let ((m (assoc id *gm-threads*))) (and m (cadr m))))
+
+(define (gm--full-cached id)
+  (let ((f (assoc id *gm-full*)))
+    (and f (or (not (gm--known-history id)) (equal? (cadr f) (gm--known-history id))) (caddr f))))
+
+(define (gm--full-put! id j)
+  (set! *gm-full* (cons (list id (plist-get j 'historyId) j)
+                        (let ((rest (filter (lambda (e) (not (equal? (car e) id))) *gm-full*)))
+                          (list-head rest (min 300 (length rest)))))))
+
+(define (gm--full mb id)
+  (or (gm--full-cached id)
+      (let ((j (gm--get mb (string-append "/threads/" id) (list "format" "full"))))
+        (gm--full-put! id j)
+        j)))
+
+;; fetch IDS whole in the background, those not cached or in flight
+(define (gm--prefetch! mb ids)
+  (let ((todo (filter (lambda (id) (and (not (gm--full-cached id)) (not (member id *gm-fetching*)))) ids)))
+    (unless (null? todo)
+      (set! *gm-fetching* (append todo *gm-fetching*))
+      (task-run! (lambda () (gm--pmap (lambda (id) (gm--full mb id)) todo))
+                 (lambda (ok? v)
+                   (set! *gm-fetching* (filter (lambda (id) (not (member id todo))) *gm-fetching*)))))))
+
+;; the threads around ID in the last index
+(define (gm--neighbours id n)
+  (let loop ((ids *gm-last-rows*) (i 0))
+    (cond ((null? ids) '())
+          ((equal? (car ids) id)
+           (let ((lo (max 0 (- i n))))
+             (filter (lambda (x) (not (equal? x id)))
+                     (list-head (list-tail *gm-last-rows* lo) (min (+ n n 1) (- (length *gm-last-rows*) lo))))))
+          (else (loop (cdr ids) (+ i 1))))))
 
 ;; (MESSAGE-ID THREAD-ID) for Gmail search TEXT, every page up to LIMIT
 (define (gm--list-messages mb text limit)
@@ -362,9 +457,10 @@
   (list (map (lambda (m) (list m '())) msgs)))
 
 (define (gm--show mb thread html?)
+  (when html? (gm--prefetch! mb (gm--neighbours thread 2)))
   (let ((j (if html?
-               (gm--get mb (string-append "/threads/" thread) (list "format" "full"))
-               (gm--thread-meta mb thread #f))))
+               (gm--full mb thread)
+               (or (gm--full-cached thread) (gm--thread-meta mb thread #f)))))
     (gm--forest (map (lambda (m) (gm--message mb m html? html?)) (or (plist-get j 'messages) '())))))
 
 ;;; --- tagging
@@ -378,6 +474,52 @@
     (map (lambda (w) (list (string-ref w 0) (substring w 1 (string-length w))))
          (filter (lambda (w) (and (> (string-length w) 1) (memv (string-ref w 0) '(#\+ #\-)))) ws))))
 
+;; PLIST with KEY set to VALUE, as a new list
+(define (gm--plist-set plist key value)
+  (cond ((null? plist) (list key value))
+        ((eq? (car plist) key) (cons key (cons value (cddr plist))))
+        (else (cons (car plist) (cons (cadr plist) (gm--plist-set (cddr plist) key value))))))
+
+(define (gm--relabel-json j add drop)
+  (gm--plist-set j 'messages
+    (map (lambda (m)
+           (gm--plist-set m 'labelIds
+             (append (filter (lambda (l) (not (member l drop))) (or (plist-get m 'labelIds) '()))
+                     (filter (lambda (l) (not (member l (or (plist-get m 'labelIds) '())))) add))))
+         (or (plist-get j 'messages) '()))))
+
+;; thread ID as if Gmail had taken the change already: its headers, its
+;; whole text and every cached index row that holds it
+(define (gm--relabel-cached! id add drop cs)
+  (let ((relabel (lambda (e) (if (equal? (car e) id) (list (car e) (cadr e) (gm--relabel-json (caddr e) add drop)) e))))
+    (set! *gm-threads* (map relabel *gm-threads*))
+    (set! *gm-full* (map relabel *gm-full*)))
+  (let ((plus (map cadr (filter (lambda (c) (char=? (car c) #\+)) cs)))
+        (minus (map cadr (filter (lambda (c) (char=? (car c) #\-)) cs))))
+    (set! *gm-swr*
+     (map
+     (lambda (e)
+       (if (not (and (pair? (car e)) (eq? (car (car e)) 'search)))
+         e
+         (list (car e) (cadr e)
+           (map (lambda (r)
+                  (if (equal? (plist-get r 'thread) id)
+                      (gm--plist-set r 'tags
+                        (append (filter (lambda (t) (not (member t minus))) (plist-get r 'tags))
+                                (filter (lambda (t) (not (member t (plist-get r 'tags)))) plus)))
+                      r))
+                (caddr e))
+           (cadddr e))))
+     *gm-swr*))))
+
+;; a modify answers the thread: its new historyId keeps the caches current
+(define (gm--history-from! j)
+  (let ((id (and (pair? j) (plist-get j 'id))) (h (and (pair? j) (plist-get j 'historyId))))
+    (when (and id h)
+      (let ((rehist (lambda (e) (if (equal? (car e) id) (list (car e) h (caddr e)) e))))
+        (set! *gm-threads* (map rehist *gm-threads*))
+        (set! *gm-full* (map rehist *gm-full*))))))
+
 (define (gm--tag! mb changes query)
   (let* ((cs (gm--changes changes))
          (add (filter (lambda (x) x) (map (lambda (c) (and (char=? (car c) #\+) (gm--label-id mb (cadr c) #t))) cs)))
@@ -386,7 +528,15 @@
          (q (gm--query query)))
     (cond ((and (null? add) (null? drop)) "")
           ((and (pair? (car q)) (equal? (cadr q) ""))
-           (for-each (lambda (id) (gm--post mb (string-append "/threads/" id "/modify") body)) (car q))
+           ;; a thread by id: the caches change now, Gmail in the background
+           (for-each (lambda (id) (gm--relabel-cached! id add drop cs)) (car q))
+           (gm--redraw-soon!)
+           (task-run! (lambda ()
+                        (map (lambda (id) (gm--post mb (string-append "/threads/" id "/modify") body)) (car q)))
+                      (lambda (ok? answers)
+                        (if ok?
+                            (for-each gm--history-from! answers)
+                            (message "Gmail did not take the tag change; g reloads"))))
            "")
           (else
            (let* ((ms (gm--list-messages mb (cadr q) 100000))
@@ -401,6 +551,9 @@
 ;;; --- counting
 
 (define (gm--count mb query)
+  (gm--swr (list 'count (gm--email mb) query) (lambda () (gm--count-now mb query))))
+
+(define (gm--count-now mb query)
   (let* ((q (gm--query query)) (ids (car q)) (text (cadr q)))
     (cond ((and (pair? ids) (equal? text ""))
            (apply + (map (lambda (id)
@@ -543,6 +696,7 @@
 
 (define (gm--changed mb after since)
   (let* ((ids (gm--dedupe (map car (gm--added mb after))))
+         (_ (unless (null? ids) (gm--swr-stale!) (gm--redraw-soon!)))
          (ms (gm--pmap (lambda (id) (gm--call mb "GET" (string-append "/messages/" id gm--meta-path))) ids)))
     (filter (lambda (m) (>= (plist-get m 'timestamp) since))
             (map (lambda (m) (gm--message mb m #f #f)) (filter (lambda (m) m) ms)))))
