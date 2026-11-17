@@ -2460,15 +2460,37 @@ them the address is live, so a purge never follows one."
                    (string-append "<pre style=\"white-space:pre-wrap;font:inherit\">"
                                   (html-escape (nm--parts-text (plist-get msg 'body)))
                                   "</pre>"))))
+    ;; a newline before each message: it starts a line of its own, where
+    ;; imenu's jump to the line lands inside it
     (string-append
-      "<mail-message message-id=\"" (html-escape (or (plist-get msg 'id) "")) "\">"
+      "\n<mail-message id=\"" (html-escape (nm--msg-anchor-name msg)) "\""
+      " message-id=\"" (html-escape (or (plist-get msg 'id) "")) "\">"
       "<header><mail-from>" (html-escape (or (plist-get h 'From) "")) "</mail-from> · "
       "<mail-date>" (html-escape (or (plist-get h 'Date) "")) "</mail-date>"
       (let ((to (plist-get h 'To)))
         (if to (string-append " · to <mail-to>" (html-escape to) "</mail-to>") ""))
       "</header>" (nm--attachment-html msg) "<mail-body>" body "</mail-body></mail-message>")))
 
-(define (nm--thread-html subject msgs)
+(define (nm--msg-anchor-name msg)
+  ;; a message's name in both views: the id of its <mail-message> in the
+  ;; html page, and the anchor of its part in either
+  (string-append "message:" (url-encode (or (plist-get msg 'id) ""))))
+
+;; -> (HTML RANGES): the page, and each message's (START END), the bytes of
+;; its <mail-message> element in HTML
+(define (nm--thread-page subject msgs)
+  (let* ((head (nm--thread-html-head subject))
+         (parts (map nm--msg-html msgs))
+         (ranges (let loop ((ps parts) (at (string-byte-length head)) (acc '()))
+                   (if (null? ps)
+                       (reverse acc)
+                       (let ((n (string-byte-length (car ps))))
+                         ;; each part opens with its newline; the element follows it
+                         (loop (cdr ps) (+ at n) (cons (list (+ at 1) (+ at n)) acc)))))))
+    (list (string-append head (apply string-append parts) "</mail-thread></body></html>")
+          ranges)))
+
+(define (nm--thread-html-head subject)
   (string-append
     "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>"
     (html-escape subject)
@@ -2480,9 +2502,7 @@ them the address is live, so a purge never follows one."
     "mail-subject{display:block;font:700 21px/1.3 system-ui;"
     "color:var(--default-fg,#141310);margin:0 0 6px}</style></head>"
     "<body style=\"margin:14px;font-family:system-ui\"><mail-thread>"
-    "<mail-subject>" (html-escape subject) "</mail-subject>"
-    (fold (lambda (acc m) (string-append acc (nm--msg-html m))) "" msgs)
-    "</mail-thread></body></html>"))
+    "<mail-subject>" (html-escape subject) "</mail-subject>"))
 
 ;; The plain-text view keeps the text buffer's message offsets for commands,
 ;; but renders records rather than asking the client to infer mail from lines.
@@ -2529,8 +2549,75 @@ them the address is live, so a purge never follows one."
           ((nm--parts-html (plist-get (car ms) 'body)) #t)
           (else (loop (cdr ms))))))
 
+;; Each message is an anchor over its bytes, in either view, named by
+;; nm--msg-anchor-name. imenu lists them as "3. Sender · date" and jumps
+;; by moving point; anchor-mode says which anchor holds point, and the html
+;; preview scrolls to the element of that id.
+(define (nm--imenu-sender from)
+  (let ((name (string-trim (car (string-split from "<")))))
+    (string-trim (re-replace-all "\"" (if (equal? name "") from name) ""))))
+
+(define (nm--imenu-date date)
+  ;; "Mon, 19 Oct 2026 23:40:22 +0530" -> "19 Oct 2026 23:40"
+  (let* ((s (let ((p (string-split date ", "))) (if (pair? (cdr p)) (cadr p) date)))
+         (w (string-split s " ")))
+    (if (>= (length w) 4)
+        (string-append (list-ref w 0) " " (list-ref w 1) " " (list-ref w 2) " "
+                       (let ((t (list-ref w 3))) (if (> (string-length t) 5) (substring t 0 5) t)))
+        date)))
+
+;; RANGES are the (START END) of each of MSGS in BUF's text
+(define (nm--anchor-thread! buf msgs ranges)
+  (anchor-index! buf
+    (let loop ((ms msgs) (rs ranges) (i 1) (acc '()))
+      (if (or (null? ms) (null? rs))
+          (reverse acc)
+          (let* ((h (plist-get (car ms) 'headers))
+                 (from (or (plist-get h 'From) ""))
+                 (date (or (plist-get h 'Date) "")))
+            (loop (cdr ms) (cdr rs) (+ i 1)
+                  (cons (list (nm--msg-anchor-name (car ms)) (car (car rs)) (cadr (car rs)) #f
+                              (list 'kind "message"
+                                    'title (string-append (number->string i) ". " (nm--imenu-sender from)
+                                                          " · " (nm--imenu-date date))
+                                    'doc (string-append from " · " date)))
+                        acc))))))
+  (buffer-set-local! buf 'anchor-imenu-index 'nm--show-imenu-index)
+  (unless (minor-mode-on? buf "anchor-mode") (enable-minor-mode! buf "anchor-mode")))
+
+;; imenu's rows, data only: (LINE KIND TITLE DOC)
+(define (nm--show-imenu-index buf)
+  (map (lambda (a)
+         (list (with-current-buffer buf (lambda () (line-number-at-pos (anchor-start a))))
+               "message" (plist-get (anchor-data a) 'title) (plist-get (anchor-data a) 'doc)))
+       (anchor-list buf)))
+
+;; the html page into BUF: its text, the messages' real offsets as
+;; notmuch-msgs (START ID FILENAME), and their anchors
+(define (nm--show-html! buf subject msgs)
+  (let* ((page (nm--thread-page subject msgs))
+         (ranges (cadr page)))
+    (buffer-delete-range! buf 0 (buffer-size buf))
+    (buffer-append! buf (car page))
+    (buffer-set-local! buf 'notmuch-msgs
+      (let loop ((ms msgs) (rs ranges) (acc '()))
+        (if (or (null? ms) (null? rs))
+            (reverse acc)
+            (loop (cdr ms) (cdr rs)
+                  (cons (list (car (car rs)) (plist-get (car ms) 'id) (plist-get (car ms) 'filename)) acc)))))
+    (nm--anchor-thread! buf msgs ranges)))
+
+;; the text view's offsets are where each message's header line begins,
+;; less its newline; a message runs to the next one
+(define (nm--text-ranges offsets size)
+  (let loop ((os offsets) (acc '()))
+    (if (null? os)
+        (reverse acc)
+        (loop (cdr os)
+              (cons (list (+ (car (car os)) 1) (if (pair? (cdr os)) (car (cadr os)) size)) acc)))))
+
 (mode-doc! "notmuch-show-mode"
-  "One mail thread, read. `a` archives it, `L` files it for the agent (+liked -inbox) and `r` starts a reply. `C-c a` opens an attachment. `v` changes between HTML and plain text. `q` goes back to the search.")
+  "One mail thread, read. `a` archives it, `L` files it for the agent (+liked -inbox) and `r` starts a reply. `C-c a` opens an attachment. `v` changes between HTML and plain text. imenu (`M-g i`) jumps to a message of the thread. `q` goes back to the search.")
 
 (mode-icon! "notmuch-show-mode" "")
 
@@ -2554,28 +2641,20 @@ them the address is live, so a purge never follows one."
             (buffer-delete-range! buf 0 (buffer-size buf))
             (if html?
                 (begin
-                  (buffer-append! buf (nm--thread-html subject msgs))
                   (buffer-set-local! buf 'render-mode "html")
+                  (nm--show-html! buf subject msgs)
                   ;; authored colors assume a white canvas — by default the
                   ;; theme repaints the document instead (dark mode stays
                   ;; readable); customize notmuch-html-original-colors to
                   ;; get the untouched rendering back
                   (buffer-set-local! buf 'preview-authored
-                    notmuch-html-original-colors)
-                  ;; fake ascending offsets: point stays 0 in the html view,
-                  ;; so "message at point" means the first (newest) message
-                  (buffer-set-local! buf 'notmuch-msgs
-                    (let loop ((ms msgs) (i 0) (acc '()))
-                      (if (null? ms)
-                          (reverse acc)
-                          (loop (cdr ms) (+ i 1)
-                                (cons (list i (plist-get (car ms) 'id)
-                                            (plist-get (car ms) 'filename))
-                                      acc))))))
+                    notmuch-html-original-colors))
                 (let ((rendered (nm--render-text subject msgs)))
                   (buffer-append! buf (car rendered))
                   (nm--thread-composml! buf subject msgs (cadr rendered))
-                  (buffer-set-local! buf 'notmuch-msgs (cadr rendered))))
+                  (buffer-set-local! buf 'notmuch-msgs (cadr rendered))
+                  (nm--anchor-thread! buf msgs
+                    (nm--text-ranges (cadr rendered) (string-byte-length (car rendered))))))
             (goto-char! 0)))))))
 
 (mode-keys! "notmuch-show-mode"
