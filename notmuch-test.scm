@@ -1476,3 +1476,43 @@
     (run-command "notmuch-mark-toggle")
     (check-contains! (nm--search-meta "*notmuch*") "All matching messages selected except 1 thread" "less one")
     (t--nm-tag-done!)))
+
+;;; --- the Gmail backend, without the network
+
+(deftest 'gmail-translates-notmuch-queries
+  "tags become Gmail's places and labels, thread: picks threads, the rest is dropped"
+  (lambda ()
+    (check-equal! (gm--query "tag:inbox and not tag:unread") '(() "in:inbox -is:unread") "system tags")
+    (check-equal! (gm--query "from:a@b.com (tag:spam or tag:Receipts)")
+                  '(() "from:a@b.com ( in:spam OR label:Receipts )") "or, parentheses and a user label")
+    (check-equal! (gm--query "subject:\"hello there\" date:@1700000000..")
+                  '(() "subject:\"hello there\" after:1700000000") "quoted words and an epoch date")
+    (check-equal! (gm--query "thread:abc AND (tag:spam OR tag:phishing)")
+                  '(("abc") "( in:spam OR label:phishing )") "thread ids apart")
+    (check-equal! (gm--query "*") '(() "") "everything")
+    (check-equal! (gm--query "lastmod:3.. tag:/^log/ id:x@y") '(() "rfc822msgid:x@y") "what Gmail cannot ask is dropped")))
+
+(deftest 'gmail-numbers-parts-as-notmuch-does
+  "depth first from 1, text decoded, attachments by size"
+  (lambda ()
+    (check-equal!
+      (gm--parts '(gmail "me@example.com") "m1"
+                 (list 'mimeType "multipart/mixed"
+                       'parts (list (list 'mimeType "text/plain" 'body (list 'data "aGVsbG8NCndvcmxk"))
+                                    (list 'mimeType "image/png" 'filename "a.png"
+                                          'headers (list (list 'name "Content-ID" 'value "<img1>"))
+                                          'body (list 'attachmentId "A1" 'size 10))))
+                 #f)
+      '((id 1 content-type "multipart/mixed"
+         content ((id 2 content-type "text/plain" content "hello\nworld")
+                  (id 3 content-type "image/png" filename "a.png" content-id "img1" content-length 10))))
+      "the tree")
+    (check-equal! (cadr (assv 3 (cdr (assoc "m1" *gm-parts*)))) "A1" "the attachment id is kept")))
+
+(deftest 'a-gmail-mailbox-is-kept-as-host-and-profile
+  "(gmail ADDRESS) round-trips through notmuch-host"
+  (lambda ()
+    (check-equal! (nm--entry->pair '(gmail "me@example.com")) '("gmail:me@example.com" "") "entry to pair")
+    (check-equal! (nm--pair->mailbox "gmail:me@example.com" "") '(gmail "me@example.com") "pair to mailbox")
+    (check-equal! (nm--pair->mailbox "marilyn" "recruiting") '("marilyn" "recruiting") "a notmuch host stays")
+    (check-equal! (car (nm--backend '(gmail "me@example.com"))) 'search "gmail has a backend")))
