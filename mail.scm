@@ -2877,6 +2877,14 @@ else{var p=null;try{p=readline()}catch(e){}
 
 (mode-icon! "notmuch-show-mode" "")
 
+;; THUNK now when a window shows BUF, else once a window does. Not
+;; buffer-when-shown!: it counts the current buffer as shown, and a mode
+;; hook always runs with its page current, hidden or not.
+(define (nm--when-shown! buf thunk)
+  (if (buffer-shown? buf)
+      (thunk)
+      (buffer-request-refresh! buf 'nm-render thunk)))
+
 (define-mode "notmuch-show-mode"
   (lambda ()
     (let ((buf (current-buffer)))
@@ -2884,7 +2892,10 @@ else{var p=null;try{p=readline()}catch(e){}
       (when (buffer-known? *notmuch-search-buffer*)
         (buffer-child! *notmuch-search-buffer* buf))
       (let ((th (buffer-local-value 'notmuch-thread buf)))
+        ;; not one instruction for a hidden page: the fetch and the render
+        ;; wait until a window shows it (a restored desktop holds many)
         (when th
+          (nm--when-shown! buf (lambda () (with-current-buffer buf (lambda ()
           (let* ((subject (or (buffer-local-value 'notmuch-subject buf) ""))
                  (msgs (nm--show-msgs th))
                  (html? (and notmuch-prefer-html
@@ -2923,7 +2934,7 @@ else{var p=null;try{p=readline()}catch(e){}
                   (buffer-set-local! buf 'notmuch-msgs (cadr rendered))
                   (nm--anchor-thread! buf msgs
                     (nm--text-ranges (cadr rendered) (string-byte-length (car rendered))))))
-            (goto-char! 0)))))))
+            (goto-char! 0)))))))))))
 
 (mode-keys! "notmuch-show-mode"
   '(

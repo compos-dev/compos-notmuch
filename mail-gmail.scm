@@ -55,16 +55,14 @@
 ;;; --- base64url
 
 (define (gm--b64url->b64 s)
-  (let* ((t (string-map (lambda (c) (cond ((char=? c #\-) #\+) ((char=? c #\_) #\/) (else c))) s))
+  ;; string-replace is a builtin: string-map recurses once per character
+  ;; and overflows on a body of 100k characters
+  (let* ((t (string-replace (string-replace s "-" "+") "_" "/"))
          (pad (modulo (- 4 (modulo (string-length t) 4)) 4)))
     (string-append t (make-string pad #\=))))
 
 (define (gm--b64->b64url s)
-  (string-map (lambda (c) (cond ((char=? c #\+) #\-) ((char=? c #\/) #\_) (else c)))
-              (let loop ((s s))
-                (if (and (> (string-length s) 0) (char=? (string-ref s (- (string-length s) 1)) #\=))
-                    (loop (substring s 0 (- (string-length s) 1)))
-                    s))))
+  (string-replace (string-replace (string-replace s "=" "") "+" "-") "/" "_"))
 
 (define (gm--decode data)
   (string-replace (or (ignore-errors (lambda () (base64-decode (gm--b64url->b64 data)))) "") "\r\n" "\n"))
