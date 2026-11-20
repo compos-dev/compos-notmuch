@@ -188,7 +188,12 @@
 (define (gm--query query)
   (let loop ((ws (gm--words (or query ""))) (threads '()) (acc '()) (neg #f))
     (if (null? ws)
-        (list (reverse threads) (string-join (reverse acc) " "))
+        ;; thread:A or thread:B leaves only ORs and parentheses as text: that
+        ;; is a list of threads, not a search for the word OR
+        (list (reverse threads)
+              (if (null? (filter (lambda (w) (not (member w '("OR" "(" ")")))) acc))
+                  ""
+                  (string-join (reverse acc) " ")))
         (let* ((w (car ws)) (lw (string-downcase w)))
           (cond ((equal? lw "and") (loop (cdr ws) threads acc neg))
                 ((equal? lw "or") (loop (cdr ws) threads (cons "OR" acc) neg))
