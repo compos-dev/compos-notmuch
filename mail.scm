@@ -536,6 +536,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
 ;; offset (R8); these names stay for the commands and tests that call them
 (define (nm--refresh! buf)
   (buffer-set-local! buf 'nm-count #f)
+  (buffer-set-local! buf 'nm-tab-counts #f)
   (list-refresh! buf))
 (define (nm--index-at buf) (list-index buf))
 (define (nm--thread-at buf) (list-current buf))
@@ -580,6 +581,68 @@ mail-threads mail-thread[marked=true]:not(.selected) {
   ;; The shared list already moved point to this record. Match n/p behavior.
   (nm--maybe-preview! buf))
 
+;; Tabs over the list: each one is a whole search, not a filter on top.
+;; Taking a tab replaces the base query and drops the filters.
+(define nm-tabs
+  '(("inbox" "Inbox" "tag:inbox")
+    ("unread" "Unread" "tag:inbox and tag:unread")
+    ("important" "Important" "tag:inbox and tag:important")
+    ("newsletter" "Newsletters" "tag:newsletter and date:30d..")))
+
+;; Thread counts for every tab in one trip to the mail host, kept until the
+;; next refresh (g, a tab, or a tag change) so a redraw costs nothing.
+(define (nm--tab-counts buf)
+  ;; through the backend, in a task: a redraw never waits on the mail host.
+  ;; The tabs draw without counts until they arrive, then draw again.
+  (or (buffer-local-value 'nm-tab-counts buf)
+      (begin
+        (unless (buffer-local-value 'nm-tab-counts-pending buf)
+          (buffer-set-local! buf 'nm-tab-counts-pending #t)
+          (task-run!
+            (lambda ()
+              (map (lambda (t)
+                     (let ((n (ignore-errors (lambda () (nm--op 'count (caddr t))))))
+                       (if (number? n) (number->string n) "")))
+                   nm-tabs))
+            (lambda (ok? counts)
+              (when (buffer-known? buf)
+                (buffer-set-local! buf 'nm-tab-counts-pending #f)
+                (when ok?
+                  (buffer-set-local! buf 'nm-tab-counts counts)
+                  (list-refresh! buf))))))
+        (map (lambda (t) "") nm-tabs))))
+
+(define (nm--tabs buf)
+  (let ((base (nm--query-base-of buf))
+        (plain? (null? (nm--query-filters-of buf)))
+        (counts (nm--tab-counts buf)))
+    (tab-bars-keyed 'index
+      (let loop ((ts nm-tabs) (cs counts) (acc '()))
+        (if (null? ts) (reverse acc)
+            (let ((t (car ts)) (c (car cs)))
+              (loop (cdr ts) (cdr cs)
+                    (cons (list (string-append "notmuch-tab-" (car t))
+                                (if (equal? c "") (cadr t) (string-append (cadr t) " " c))
+                                (and plain? (equal? base (caddr t))))
+                          acc))))))))
+
+(define (nm--take-tab! buf id)
+  (let ((t (assoc id nm-tabs)))
+    (when t
+      (buffer-set-local! buf 'notmuch-selection #f)
+      (buffer-set-local! buf 'notmuch-query-base (caddr t))
+      (buffer-set-local! buf 'notmuch-query-filters '())
+      (buffer-set-local! buf 'notmuch-query-positions '())
+      (nm--refresh! buf)
+      (list-goto-first-entry buf)
+      #t)))
+
+(add-hook! (list 'block-click 'notmuch)
+  (lambda (buf id)
+    (and (string? id) (string-prefix? "notmuch-tab-" id)
+         (buffer-exists? buf) (buffer-derived-mode? buf "notmuch-mode")
+         (nm--take-tab! buf (substring id 12 (string-length id))))))
+
 (define-list-mode! "notmuch-mode"
   (list
     'doc (string-append
@@ -598,6 +661,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
               (list "profile" (if (string? notmuch-profile) notmuch-profile ""))
               (list "query" (nm--query-of buf)))))
     'collection "mail-threads"
+    'head-blocks (lambda (buf) (list (component 'ui/tabs (list 'class "notmuch-tabs" 'tabs (nm--tabs buf)))))
     'composml (lambda (buf th) (nm--thread-composml buf th))
     'rows (lambda (buf) (nm--search-rows buf))
     'key (lambda (buf th) (nm--th-id th))
@@ -1037,8 +1101,11 @@ mail-threads mail-thread[marked=true]:not(.selected) {
         (set! *notmuch-pane-shown* #t))
       ;; Keep the list focused before a database write can fail.
       (nm--op 'tag! "-unread" (string-append "thread:" (nm--th-id th)))
-      ;; opening marked it read — show that in the index right away
-      (when (member "unread" (nm--th-tags th))
+      ;; opening marked it read — show that in the index right away, except
+      ;; in a search for unread mail: a refresh there would drop the row you
+      ;; are reading. It leaves on the next refresh (g or a tab).
+      (when (and (member "unread" (nm--th-tags th))
+                 (not (string-contains? (nm--query-of buf) "tag:unread")))
         (nm--refresh! buf)))))
 
 (define-command "notmuch-preview" "Preview the thread at point in the other window"
@@ -1699,7 +1766,26 @@ carries a tag outside notmuch-autotag-exclude. C-u notmuch-autotag takes them al
                                        (if kind (list kind) '())
                                        (nm--autotag-flags-said-yes reply))))
                     (task-run! (lambda () (nm--autotag-apply! id want))
-                      (lambda (ok? ops) (k (and ok? ops))))))))))))
+                      (lambda (ok? ops)
+                        (when (and ok? (pair? ops)) (nm--autotag-publish! id ops))
+                        (k (and ok? ops))))))))))))
+
+(define (nm--autotag-publish! id ops)
+  "(nm--autotag-publish! ID OPS) — the tags autotag gave and took from the thread ID
+go on mail-tag:PROFILE as a tagged event, with the first message's From and Subject"
+  (let ((profile notmuch-profile)
+        (signed (lambda (sign) (map (lambda (o) (substring o 1 (string-length o)))
+                                    (filter (lambda (o) (string-prefix? sign o)) ops)))))
+    (task-run!
+      (lambda ()
+        (let ((msgs (nm--flatten-msgs
+                      (or (nm--op 'show id #f) '()))))
+          (if (null? msgs) '() (plist-get (car msgs) 'headers))))
+      (lambda (ok? h)
+        (let ((h (if ok? h '())))
+          (event-publish! (string-append "mail-tag:" profile) 'tagged
+            (list 'id id 'mailbox profile 'added (signed "+") 'removed (signed "-")
+                  'from (or (plist-get h 'From) "") 'subject (or (plist-get h 'Subject) ""))))))))
 
 (defcustom 'notmuch-autotag-parallel 8
   "How many threads notmuch-autotag classifies at the same time.")
@@ -2331,8 +2417,40 @@ them the address is live, so a purge never follows one."
                   (else '()))))
         '() parts))
 
+;; the image parts with a Content-ID that sit straight under a multipart/related:
+;; RFC 2387 makes them resources of the body. Gmail puts a quoted mail's images
+;; there, marked attachment, under fresh ii_ ids that no cid: cites.
+(define (nm--related-image-ids parts)
+  (fold (lambda (acc part)
+          (let* ((ct (string-downcase (or (plist-get part 'content-type) "")))
+                 (kids (plist-get part 'content))
+                 (kids (if (pair? kids) kids '()))
+                 (own (if (string=? ct "multipart/related")
+                          (map (lambda (p) (plist-get p 'id))
+                               (filter (lambda (p) (and (nm--image-part? p)
+                                                        (string? (plist-get p 'content-id))))
+                                       kids))
+                          '())))
+            (append acc own (nm--related-image-ids kids))))
+        '() parts))
+
+;; the attachments a reader picks from: an image the body draws by cid: is
+;; part of the body, not an attachment, and so is an image of a multipart/related
+(define (nm--listed-attachment-parts msg &optional raw-html)
+  (let* ((body (plist-get msg 'body))
+         (raw (or raw-html (nm--parts-html body)))
+         (related (nm--related-image-ids body))
+         (inline? (lambda (p)
+                    (let ((cid (plist-get p 'content-id)))
+                      (and (nm--image-part? p)
+                           (or (member (plist-get p 'id) related)
+                               (and (string? raw) (string? cid)
+                                    (string-search (string-append "cid:" cid) raw))))))))
+    (filter (lambda (p) (not (inline? p)))
+            (nm--attachment-parts body))))
+
 (define (nm--attachment-text msg)
-  (let ((parts (nm--attachment-parts (plist-get msg 'body))))
+  (let ((parts (nm--listed-attachment-parts msg)))
     (if (null? parts) ""
         (string-append "Attachments (C-c a to open):\n"
           (string-join (map (lambda (p) (string-append "  " (plist-get p 'filename))) parts) "\n")
@@ -2372,13 +2490,7 @@ them the address is live, so a purge never follows one."
         html (nm--attachment-parts (plist-get msg 'body))))
 
 (define (nm--attachment-html msg &optional raw-html)
-  ;; an image the body already draws by cid: is not an attachment to list
-  (let* ((inline? (lambda (p)
-                    (let ((cid (plist-get p 'content-id)))
-                      (and (string? raw-html) (string? cid) (nm--image-part? p)
-                           (string-search (string-append "cid:" cid) raw-html)))))
-         (parts (filter (lambda (p) (not (inline? p)))
-                        (nm--attachment-parts (plist-get msg 'body)))))
+  (let ((parts (nm--listed-attachment-parts msg raw-html)))
     (if (null? parts) ""
         (string-append "<mail-attachments><strong>Attachments</strong>"
           (string-join (map (lambda (p)
@@ -2418,7 +2530,7 @@ them the address is live, so a purge never follows one."
             (map (lambda (part)
                    (list (plist-get part 'filename)
                          (nm--op 'part-command (plist-get msg 'id) (plist-get part 'id))))
-                 (nm--attachment-parts (plist-get msg 'body)))))
+                 (nm--listed-attachment-parts msg))))
         '() msgs))
 
 (define (nm--attachment-filename name)
@@ -2448,7 +2560,8 @@ else{var p=null;try{p=readline()}catch(e){}
                                  " < " stdin " 2>/dev/null; rm -f " (sh-quote pw))
                   (lambda (r) (k (string-trim r)))))))
     (write-file! js nm--pdf-unlock-js)
-    (letrec ((ask (lambda (prompt)
+    (let ()
+      (define (ask prompt)
                     (minibuffer-read prompt '()
                       (lambda (input)
                         (if (or (not (string? input)) (string=? input ""))
@@ -2458,7 +2571,7 @@ else{var p=null;try{p=readline()}catch(e){}
                               (run (sh-quote pw)
                                    (lambda (r)
                                      (cond ((equal? r "unlocked") (visit out))
-                                           (else (ask (string-append "Wrong password for " name ": ")))))))))))))
+                                           (else (ask (string-append "Wrong password for " name ": ")))))))))))
       (run "/dev/null"
            (lambda (r)
              (if (equal? r "locked")
@@ -2776,7 +2889,7 @@ else{var p=null;try{p=readline()}catch(e){}
                                    'attrs (list (list "part-id" (plist-get part 'id))
                                                 (list "content-type" (or (plist-get part 'content-type) "")))
                                    'text (plist-get part 'filename)))
-                           (nm--attachment-parts (plist-get msg 'body))))
+                           (nm--listed-attachment-parts msg)))
                 (list 'tag "mail-body" 'children
                       (list (list 'tag "pre" 'text (nm--msg-body-text msg))))))))
 
@@ -3375,6 +3488,38 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
                           " (notmuch thread:" th ")"
                           (if msg (string-append ", message id:" (cadr msg)) ""))))))
 
+;; a mail row can carry a task: the thread is its source, and the task's
+;; page opens the thread beside it
+(define (nm--todo-item buf)
+  (let ((th (nm--thread-at buf)))
+    (and th
+         (list 'title (nm--th-subject th)
+               'source (string-append "mail:thread:" (nm--th-id th))
+               'notes (string-append "Mail from " (nm--th-authors th) ": \"" (nm--th-subject th) "\"")))))
+
+(define (nm--todo-item-show buf)
+  (let ((th (buffer-local-value 'notmuch-thread buf))
+        (subject (or (buffer-local-value 'notmuch-subject buf) "")))
+    (and th
+         (list 'title subject
+               'source (string-append "mail:thread:" th)
+               'notes (string-append "Mail: \"" subject "\"")))))
+
+(define (nm--todo-source-open! key)
+  (let* ((id (substring key 12 (string-length key)))
+         (row (string-split (string-trim (mail-search (string-append "thread:" id))) " | "))
+         (subject (if (>= (length row) 3) (list-ref row 2) "mail")))
+    (display-buffer-other-window! (nm--open-thread! id subject 'keep-unread))))
+
+(define (nm--register-todo-items!)
+  ;; older todo packages only; the current one has neither call
+  (when (boundp 'todo-item-register!)
+    (todo-item-register! "notmuch-mode" nm--todo-item)
+    (todo-item-register! "notmuch-show-mode" nm--todo-item-show))
+  (when (boundp 'todo-source-opener-register!)
+    (todo-source-opener-register! "mail:thread:" nm--todo-source-open!)))
+(if (featurep 'todo) (nm--register-todo-items!) (with-eval-after-load 'todo nm--register-todo-items!))
+
 ;;; --- mail for the model -------------------------------------------------------
 ;;; No per-domain tools: mail is reached through eval-scheme + act. Search
 ;;; and read are public functions over the same code the UI uses.
@@ -3697,6 +3842,23 @@ mail-feed-enabled starts the rest of the feed."
 
 (event-subscribe! "mail-notify" "mail:*" 'mail-notify--saw)
 
+(defcustom 'mail-notify-autotags '("ephemeral")
+  "Tags that make a notice when notmuch-autotag gives them to a thread.")
+
+(define (mail-notify--tagged e)
+  "a thread autotag gave one of mail-notify-autotags makes a notice: the tag and sender, then the subject"
+  (let* ((d (plist-get e 'data))
+         (hit (filter (lambda (t) (member t mail-notify-autotags)) (or (plist-get d 'added) '()))))
+    (when (and mail-notify (eq? (plist-get e 'kind) 'tagged) (pair? hit))
+      (notify! "mail"
+               (string-append (string-join hit " ") " · "
+                              (string-trim (mail-notify--name (let ((f (plist-get d 'from))) (if (equal? f "") "Mail" f)))))
+               (or (plist-get d 'subject) "")
+               (list 'topic (plist-get e 'topic) 'event (plist-get e 'seq)
+                     'mailbox (plist-get d 'mailbox) 'thread (plist-get d 'id))))))
+
+(event-subscribe! "mail-notify-tagged" "mail-tag:*" 'mail-notify--tagged)
+
 ;; effects stamps for the names declared above without one, so
 ;; eval-scheme-read takes or refuses them by what they do
 (for-each (lambda (n) (catalog-meta! 'function (symbol->string n) 'effects '(read execute)))
@@ -3706,3 +3868,24 @@ mail-feed-enabled starts the rest of the feed."
 (for-each (lambda (n) (catalog-meta! 'function (symbol->string n) 'effects '(write display)))
   '(mail-open!))
 
+
+;; 1-3 take the tabs, / picks one by name (tab-bars.scm)
+(tab-bars-declare! "notmuch-mode" (lambda (buf) (list (list "Tabs" (nm--tabs buf)))))
+
+;; <left> and <right> step the tabs, wrapping at either end
+(define (nm--tab-step! buf delta)
+  (let* ((tabs (nm--tabs buf))
+         (n (length tabs))
+         (at (let loop ((ts tabs) (i 0)) (cond ((null? ts) #f) ((caddr (car ts)) i) (else (loop (cdr ts) (+ i 1))))))
+         (next (modulo (+ (or at (if (> delta 0) -1 0)) delta) n))
+         (id (car (list-ref tabs next))))
+    (nm--take-tab! buf (substring id 12 (string-length id)))))
+
+(define-command "notmuch-tab-next" "Show the next tab of the mail list"
+  (lambda () (nm--tab-step! (current-buffer) 1))
+  'modes '(notmuch-mode))
+(define-command "notmuch-tab-prev" "Show the previous tab of the mail list"
+  (lambda () (nm--tab-step! (current-buffer) -1))
+  'modes '(notmuch-mode))
+(define-key "notmuch-mode-map" "<right>" "notmuch-tab-next")
+(define-key "notmuch-mode-map" "<left>" "notmuch-tab-prev")
