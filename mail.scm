@@ -2893,6 +2893,9 @@ else{var p=null;try{p=readline()}catch(e){}
     ;; body fits the card, and what still will not scrolls inside the card
     "mail-body{overflow-x:auto;min-width:0}"
     "mail-body table,mail-body tbody,mail-body tr,mail-body td,mail-body th,mail-body div,mail-body center{max-width:100%!important;box-sizing:border-box}"
+    ;; a table's width attribute ignores max-width: one fixed in pixels
+    ;; sizes to its content instead, which fits the card
+    "mail-body table[width]:not([width$=\"%\"]){width:auto!important}"
     "mail-body td,mail-body th{overflow-wrap:anywhere}"
     "mail-body pre{margin:0}"
     "details.mail-quoted{margin:10px 0 0}"
