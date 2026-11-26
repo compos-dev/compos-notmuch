@@ -1266,6 +1266,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
 (define-command "notmuch-refresh" "Re-run the search and refresh the listing"
   (lambda ()
     (let ((buf (current-buffer)))
+      (when (nm--backend-has? 'invalidate) (nm--op 'invalidate))
       (nm--after-change! buf)
       (message "Refreshed")))
   'modes '(notmuch-mode))

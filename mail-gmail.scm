@@ -320,27 +320,35 @@
                  (nm--refresh! *notmuch-search-buffer*)))
              #f))
 
-(define (gm--swr key compute)
+(define (gm--swr key compute &optional transform)
   (let ((hit (assoc key *gm-swr*)))
     (cond ((not hit)
-           (let ((v (compute))) (gm--swr-set! key v #f) v))
+           (let* ((raw (compute))
+                  (v (if transform (transform raw) raw)))
+             (gm--swr-set! key v #f)
+             v))
           (else
-           (when (and (not (cadddr hit)) (> (- (monotonic-ms) (cadr hit)) gm-fresh-ms))
+           (when (and (not (cadddr hit))
+                      (or (not (cadr hit))
+                          (> (- (monotonic-ms) (cadr hit)) gm-fresh-ms)))
              (gm--swr-put! key (cadr hit) (caddr hit) #t)
              (task-run! compute
-                        (lambda (ok? v)
-                          (let ((old (caddr (or (assoc key *gm-swr*) hit))))
-                            (gm--swr-set! key (if ok? v old) #f)
+                        (lambda (ok? raw)
+                          (let* ((old (caddr (or (assoc key *gm-swr*) hit)))
+                                 (v (if ok? (if transform (transform raw) raw) old)))
+                            (gm--swr-set! key v #f)
                             (when (and ok? (not (equal? v old))) (gm--redraw-soon!))))))
            (caddr hit)))))
 
 ;; the next answer for every cached search and count is Gmail's again
 (define (gm--swr-stale!)
-  (set! *gm-swr* (map (lambda (e) (list (car e) 0 (caddr e) (cadddr e))) *gm-swr*)))
+  ;; #f (never 0): BEAM monotonic-ms can be negative, so 0 looks far in the future
+  (set! *gm-swr* (map (lambda (e) (list (car e) #f (caddr e) (cadddr e))) *gm-swr*)))
 
 (define (gm--search mb query limit)
   (let ((rows (gm--swr (list 'search (gm--email mb) query limit)
-                       (lambda () (gm--search-now mb query limit)))))
+                       (lambda () (gm--search-now mb query limit))
+                       (lambda (rs) (gm--apply-pending query rs)))))
     (gm--prefetch! mb (list-head (map (lambda (r) (plist-get r 'thread)) rows) (min 6 (length rows))))
     (set! *gm-last-rows* (map (lambda (r) (plist-get r 'thread)) rows))
     rows))
@@ -538,29 +546,62 @@
                terms)
          #t)))
 
+(define gm-settle-ms 10000)
+(define *gm-pending* '()) ; ((EXPIRES-MS ID PLUS MINUS) ...)
+
+(define (gm--pending-active)
+  (let ((now (monotonic-ms)))
+    (set! *gm-pending* (filter (lambda (p) (> (car p) now)) *gm-pending*))
+    *gm-pending*))
+
+(define (gm--pending-add! id plus minus)
+  (let ((exp (+ (monotonic-ms) gm-settle-ms)))
+    (set! *gm-pending*
+      (cons (list exp id plus minus)
+            (map (lambda (p)
+                   (if (equal? (cadr p) id)
+                       (list (car p) id
+                             (filter (lambda (t) (not (member t minus))) (caddr p))
+                             (filter (lambda (t) (not (member t plus))) (cadddr p)))
+                       p))
+                 (gm--pending-active))))))
+
+(define (gm--pending-drop! id)
+  (set! *gm-pending* (filter (lambda (p) (not (equal? (cadr p) id))) *gm-pending*)))
+
+(define (gm--apply-tag-delta rows id query plus minus)
+  (if (gm--change-invalidates-query? query plus minus)
+      (filter (lambda (r) (not (equal? (plist-get r 'thread) id))) rows)
+      (map (lambda (r)
+             (if (equal? (plist-get r 'thread) id)
+                 (gm--plist-set r 'tags
+                   (append (filter (lambda (t) (not (member t minus))) (plist-get r 'tags))
+                           (filter (lambda (t) (not (member t (plist-get r 'tags)))) plus)))
+                 r))
+           rows)))
+
+(define (gm--apply-pending query rows)
+  (fold (lambda (rs p) (gm--apply-tag-delta rs (cadr p) query (caddr p) (cadddr p)))
+        rows
+        (reverse (gm--pending-active))))
+
 (define (gm--relabel-cached! id add drop cs)
   (let ((relabel (lambda (e) (if (equal? (car e) id) (list (car e) (cadr e) (gm--relabel-json (caddr e) add drop)) e))))
     (set! *gm-threads* (map relabel *gm-threads*))
     (set! *gm-full* (map relabel *gm-full*)))
   (let ((plus (map cadr (filter (lambda (c) (char=? (car c) #\+)) cs)))
-        (minus (map cadr (filter (lambda (c) (char=? (car c) #\-)) cs))))
+        (minus (map cadr (filter (lambda (c) (char=? (car c) #\-)) cs)))
+        (now (monotonic-ms)))
+    (gm--pending-add! id plus minus)
     (set! *gm-swr*
       (map
         (lambda (e)
           (if (not (and (pair? (car e)) (eq? (car (car e)) 'search)))
               e
               (let* ((query (caddr (car e)))
-                     (drop-row? (gm--change-invalidates-query? query plus minus))
-                     (rows (if drop-row?
-                               (filter (lambda (r) (not (equal? (plist-get r 'thread) id))) (caddr e))
-                               (map (lambda (r)
-                                      (if (equal? (plist-get r 'thread) id)
-                                          (gm--plist-set r 'tags
-                                            (append (filter (lambda (t) (not (member t minus))) (plist-get r 'tags))
-                                                    (filter (lambda (t) (not (member t (plist-get r 'tags)))) plus)))
-                                          r))
-                                    (caddr e)))))
-                (list (car e) (cadr e) rows (cadddr e)))))
+                     (rows (gm--apply-tag-delta (caddr e) id query plus minus)))
+                ;; refresh timestamp so immediate redraws do not race /modify
+                (list (car e) now rows (cadddr e)))))
         *gm-swr*))))
 
 ;; a modify answers the thread: its new historyId keeps the caches current
@@ -587,7 +628,11 @@
                       (lambda (ok? answers)
                         (if ok?
                             (for-each gm--history-from! answers)
-                            (message "Gmail did not take the tag change; g reloads"))))
+                            (begin
+                              (for-each gm--pending-drop! (car q))
+                              (gm--swr-stale!)
+                              (gm--redraw-soon!)
+                              (message "Gmail did not take the tag change; g reloads")))))
            "")
           (else
            (let* ((ms (gm--list-messages mb (cadr q) 100000))
@@ -825,4 +870,5 @@
                      '(("inbox" "tag:inbox") ("unread" "tag:unread") ("flagged" "tag:flagged") ("sent" "tag:sent")))
    'senders (lambda (mb query) (gm--senders mb query))
    'block-sender! (lambda (mb email) (gm--block-sender! mb email))
+   'invalidate (lambda (mb) (gm--swr-stale!))
    'send (lambda (mb text) (gm--send mb text))))
