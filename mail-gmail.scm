@@ -628,7 +628,7 @@
 ;; reply-all, as `notmuch reply --format=json` answers it
 (define (gm--reply mb msg-id)
   (let* ((m (gm--get mb (string-append "/messages/" msg-id) (list "format" "full")))
-         (orig (gm--message mb m #t #f))
+         (orig (gm--message mb m #t #t)) ; html too: the reply quotes it
          (name (gm--config mb "user.name"))
          (me (if (equal? name "") (gm--email mb) (string-append name " <" (gm--email mb) ">")))
          (from (or (gm--header m "Reply-To") (gm--header m "From") ""))

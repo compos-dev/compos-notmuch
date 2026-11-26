@@ -3215,6 +3215,23 @@ else{var p=null;try{p=readline()}catch(e){}
                              ovs))
                       (else ovs)))))))
 
+(define (nm--reply-quote orig)
+  "(ATTRIBUTION HTML) for a reply to ORIG: the line Gmail writes above a
+quote, and ORIG's own html, or its text as html when it has none."
+  (let* ((h (or (plist-get orig 'headers) '()))
+         (from (or (plist-get h 'From) ""))
+         (date (plist-get h 'Date))
+         (attrib (if (and date (not (equal? date "")))
+                     (string-append "On " date ", " from " wrote:")
+                     (string-append from " wrote:")))
+         (html (nm--parts-html (plist-get orig 'body))))
+    (list attrib
+          (if html
+              (nm--html-inner html)
+              (string-append "<div dir=\"ltr\">"
+                             (string-join (map html-escape (string-split (string-trim (nm--msg-body-text orig)) "\n")) "<br>")
+                             "</div>")))))
+
 (define (nm--compose-reply! msg-id)
   (let* ((j (nm--op 'reply msg-id))
          (rh (and j (plist-get j 'reply-headers)))
@@ -3231,18 +3248,18 @@ else{var p=null;try{p=readline()}catch(e){}
                        (hdr "In-Reply-To" 'In-reply-to)
                        (hdr "References" 'References)
                        *mail-header-separator* "\n"))
-               (attrib (let ((h (and orig (plist-get orig 'headers))))
-                         (if (and h (plist-get h 'From))
-                             (string-append (plist-get h 'From) " writes:\n\n")
-                             "")))
-               ;; quote the RENDERED text (nm--msg-body-text goes through the
-               ;; html renderer when there is no text/plain) — never raw html
+               (rq (and orig (nm--reply-quote orig)))
+               (attrib (if rq (string-append (car rq) "\n\n") ""))
+               ;; the draft quotes the RENDERED text (nm--msg-body-text goes
+               ;; through the html renderer when there is no text/plain); the
+               ;; html part quotes the original html at send time
                (quoted (if orig (nm--quote-text (nm--msg-body-text orig)) "")))
           (unless (buffer-exists? buf) (buffer-create buf))
           (buffer-delete-range! buf 0 (buffer-size buf))
           (buffer-append! buf (string-append head "\n" attrib quoted))
           (switch-to-buffer! buf)
           (set-mode! "mail-compose-mode")
+          (buffer-set-local! buf 'mail-reply-quote rq)
           (nm--compose-overlays! buf head)
           (goto-char! (string-byte-length head))
           (message "C-c C-c sends, C-c C-k aborts")))))
@@ -3321,6 +3338,72 @@ would let a word in the body pick the account the mail goes out from."
       s
       (string-append "=?UTF-8?B?" (base64-encode s) "?=")))
 
+(define (nm--md-inline s)
+  "S, already html-escaped, with Markdown code, links, bare URLs, bold and italic as html."
+  (let* ((s (re-replace-all "`([^`]+)`" s "<code>\\1</code>"))
+         (s (re-replace-all "\\[([^\\]]+)\\]\\((https?://[^ )]+)\\)" s "<a href=\"\\2\">\\1</a>"))
+         (s (re-replace-all "(?<![\"=>])(https?://[^\\s<]*[^\\s<.,;:!?)])" s "<a href=\"\\1\">\\1</a>"))
+         (s (re-replace-all "\\*\\*([^*]+)\\*\\*" s "<b>\\1</b>"))
+         (s (re-replace-all "(?<![*\\w])\\*([^*\\s][^*]*)\\*(?![*\\w])" s "<i>\\1</i>")))
+    s))
+
+(define nm--blockquote-open
+  "<blockquote class=\"gmail_quote\" style=\"margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex\">")
+
+(define (nm--md-block kind lines)
+  (let ((inline (lambda (l) (nm--md-inline (html-escape l)))))
+    (cond ((eq? kind 'ul)
+           (string-append "<ul>" (apply string-append (map (lambda (l) (string-append "<li>" (inline l) "</li>")) lines)) "</ul>"))
+          ((eq? kind 'ol)
+           (string-append "<ol>" (apply string-append (map (lambda (l) (string-append "<li>" (inline l) "</li>")) lines)) "</ol>"))
+          ((eq? kind 'quote)
+           (string-append nm--blockquote-open (mail-markdown->html (string-join lines "\n") #t) "</blockquote>"))
+          (else (string-append "<div>" (string-join (map inline lines) "<br>") "</div>")))))
+
+(define (mail-markdown->html text &optional inner?)
+  "(mail-markdown->html TEXT) — a mail body written as plain text or light Markdown, as html the way Gmail writes it: a div for each paragraph, - and 1. lists, > quotes, links, **bold**, *italic* and `code`"
+  (let loop ((ls (string-split (string-trim text) "\n")) (kind #f) (cur '()) (out '()))
+    (let* ((flush (lambda () (if kind (cons (nm--md-block kind (reverse cur)) out) out))))
+      (if (null? ls)
+          (let ((blocks (reverse (flush))))
+            (if inner?
+                (string-join blocks "<div><br></div>")
+                (string-append "<div dir=\"ltr\">" (string-join blocks "<div><br></div>") "</div>")))
+          (let* ((l (car ls))
+                 (k (cond ((equal? (string-trim l) "") #f)
+                          ((pair? (re-find* "^\\s*[-*+] " l)) 'ul)
+                          ((pair? (re-find* "^\\s*\\d+[.)] " l)) 'ol)
+                          ((pair? (re-find* "^>" l)) 'quote)
+                          (else 'p)))
+                 (body (cond ((eq? k 'ul) (re-replace "^\\s*[-*+] " l ""))
+                             ((eq? k 'ol) (re-replace "^\\s*\\d+[.)] " l ""))
+                             ((eq? k 'quote) (re-replace "^> ?" l ""))
+                             (else l))))
+            (cond ((not k) (loop (cdr ls) #f '() (flush)))
+                  ((eq? k kind) (loop (cdr ls) kind (cons body cur) out))
+                  (else (loop (cdr ls) k (list body) (flush)))))))))
+
+(define (nm--html-inner html)
+  "HTML without its document shell: what sits inside body, with no head."
+  (let* ((h (re-replace "(?is)^.*<body[^>]*>" html ""))
+         (h (re-replace "(?is)</body>.*$" h ""))
+         (h (re-replace-all "(?is)<head\\b.*?</head>" h "")))
+    (re-replace-all "(?is)</?html[^>]*>|<!doctype[^>]*>" h "")))
+
+(define (nm--mime-boundary)
+  (string-append "compos-" (number->string (abs (monotonic-ms))) "-" (number->string (random 1000000))))
+
+(define (mail-alternative-part text html)
+  "(mail-alternative-part TEXT HTML) — one multipart/alternative MIME part, its Content-Type included: TEXT as text/plain and HTML as text/html"
+  (let ((b (nm--mime-boundary)))
+    (string-append
+      "Content-Type: multipart/alternative; boundary=\"" b "\"\n\n"
+      "--" b "\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: base64\n\n"
+      (nm--base64-lines (string-append text "\n")) "\n"
+      "--" b "\nContent-Type: text/html; charset=UTF-8\nContent-Transfer-Encoding: base64\n\n"
+      (nm--base64-lines (string-append "<html><head><meta charset=\"utf-8\"></head><body>" html "</body></html>\n")) "\n"
+      "--" b "--\n")))
+
 (define (nm--default-from)
   "The From of the mailbox notmuch reads: its user.name and user.primary_email."
   (let ((name (string-trim (nm--op 'config "user.name")))
@@ -3330,8 +3413,10 @@ would let a word in the body pick the account the mail goes out from."
 (define (mail-message headers body &optional attachments)
   "(mail-message HEADERS BODY [ATTACHMENTS]) — the RFC 822 text of a mail.
 HEADERS is a plist of from, to, cc, bcc, subject, in-reply-to and references;
-from defaults to the mailbox's own address. BODY is plain text. Each of
-ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
+from defaults to the mailbox's own address, and an html entry gives the
+html part yourself. BODY is plain text or light Markdown; it goes as text
+and as html, the way Gmail sends it. Each of ATTACHMENTS is a file path,
+or (PATH NAME) to send it under another name."
   (let* ((from (or (plist-get headers 'from) (nm--default-from)))
          (head (lambda (name key)
                  (let ((v (plist-get headers key)))
@@ -3343,17 +3428,14 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
                              (head "Subject" 'subject)
                              (head "In-Reply-To" 'in-reply-to) (head "References" 'references)
                              "MIME-Version: 1.0\n"))
+         (alt (mail-alternative-part body (or (plist-get headers 'html) (mail-markdown->html body))))
          (files (or attachments '())))
     (if (null? files)
-        (string-append top "Content-Type: text/plain; charset=UTF-8\n"
-                       "Content-Transfer-Encoding: 8bit\n\n" body "\n")
-        (let ((boundary (string-append "compos-" (number->string (abs (monotonic-ms)))
-                                       "-" (number->string (random 1000000)))))
+        (string-append top alt)
+        (let ((boundary (nm--mime-boundary)))
           (string-append
             top "Content-Type: multipart/mixed; boundary=\"" boundary "\"\n\n"
-            "--" boundary "\n"
-            "Content-Type: text/plain; charset=UTF-8\n"
-            "Content-Transfer-Encoding: 8bit\n\n" body "\n"
+            "--" boundary "\n" alt
             (apply string-append
                    (map (lambda (a)
                           (let* ((path (expand-path (if (pair? a) (car a) a)))
@@ -3407,14 +3489,41 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
   "(mail-send! HEADERS BODY [ATTACHMENTS]) — build the mail as mail-message does and send it; #t when sent, else the error as a string"
   (mail-send-text! (mail-message headers body attachments)))
 
+(defvar 'mail-reply-quote #f
+  "In a reply draft: (ATTRIBUTION HTML), the line that opens the quote and the quoted mail as html.")
+
+(define (nm--split-once s sep)
+  "(BEFORE AFTER) of S around the first SEP, or #f when S has no SEP."
+  (let ((parts (string-split s sep)))
+    (if (null? (cdr parts)) #f
+        (list (car parts) (string-join (cdr parts) sep)))))
+
+(define (nm--compose->message text rq)
+  "The RFC 822 text a compose buffer sends: its headers, then the body as
+text and as html. RQ is (ATTRIBUTION HTML) when the draft is a reply:
+the html part quotes the original mail as Gmail does. A draft that names
+its own Content-Type goes as it is."
+  (let ((split (nm--split-once text (string-append "\n" *mail-header-separator* "\n"))))
+    (if (not split) text
+        (let ((head (car split)) (body (string-trim (cadr split))))
+          (if (pair? (re-find* "(?im)^(content-type|mime-version):" head))
+              (string-append head "\n\n" body "\n")
+              (let* ((cut (and rq (nm--split-once body (car rq))))
+                     (html (if cut
+                               (string-append
+                                 (mail-markdown->html (car cut))
+                                 "<br><div class=\"gmail_quote\"><div dir=\"ltr\" class=\"gmail_attr\">"
+                                 (html-escape (car rq)) "<br></div>"
+                                 nm--blockquote-open (cadr rq) "</blockquote></div>")
+                               (mail-markdown->html body))))
+                (string-append head "\nMIME-Version: 1.0\n" (mail-alternative-part body html))))))))
+
 (define-command "mail-send" "Send this buffer as an email"
   (lambda ()
-    ;; the separator line becomes the RFC822 blank line
-    (let* ((text (string-join
-                   (string-split (buffer-text (current-buffer))
-                                 (string-append "\n" *mail-header-separator* "\n"))
-                   "\n\n"))
-           (sent (mail-send-text! text)))
+    ;; the body goes as text and as html, the way Gmail sends it
+    (let* ((buf (current-buffer))
+           (sent (mail-send-text! (nm--compose->message (buffer-text buf)
+                                                        (buffer-local-value 'mail-reply-quote buf)))))
       (if (equal? sent #t)
           (begin (run-command "quit-window") (message "Sent"))
           (message (string-append "Send failed: " sent)))))
@@ -3615,6 +3724,8 @@ ATTACHMENTS is a file path, or (PATH NAME) to send it under another name."
 (effects! '(read))
 (public! 'mail-message "(mail-message HEADERS BODY [ATTACHMENTS]) — the RFC 822 text of a mail; HEADERS is a plist of from to cc bcc subject in-reply-to references, each attachment a path or (PATH NAME)")
 (effects! '(write external))
+(public! 'mail-markdown->html "(mail-markdown->html TEXT) — a mail body in plain text or light Markdown as Gmail-style html")
+(public! 'mail-alternative-part "(mail-alternative-part TEXT HTML) — a multipart/alternative MIME part of TEXT and HTML")
 (public! 'mail-send! "(mail-send! HEADERS BODY [ATTACHMENTS]) — send a mail with files attached; #t when sent, else the error")
 (public! 'mail-send-text! "(mail-send-text! TEXT) — send RFC 822 TEXT through the route its From picks; #t when sent, else the error")
 (effects! '(unknown))
