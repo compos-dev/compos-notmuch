@@ -1329,12 +1329,28 @@ mail-threads mail-thread[marked=true]:not(.selected) {
       (nm--refresh! buf)
       (nm--goto-position! buf p))))
 
+(define (nm--changes-closes-detail? changes)
+  (let ((ws (if (string? changes) (string-split changes " ") changes)))
+    (and (or (member "-inbox" ws) (member "+trash" ws)) #t)))
+
+(define (nm--close-thread-buffer! thread-id)
+  (when thread-id
+    (for-each
+      (lambda (b)
+        (when (and (buffer-exists? b)
+                   (equal? (buffer-local-value 'notmuch-thread b) thread-id)
+                   (equal? (buffer-local-value 'nm-db b) (nm--db-key)))
+          (buffer-kill! b)))
+      (nm--show-buffers))))
+
 (define (nm--tag! buf changes)
   (let ((th (nm--thread-at buf)) (pos (nm--position-of buf)))
     (if th
         (begin
           (nm--op 'tag! changes (string-append "thread:" (nm--th-id th)))
           (nm--after-change! buf pos)
+          (when (nm--changes-closes-detail? changes)
+            (nm--close-thread-buffer! (nm--th-id th)))
           (let ((still (and (equal? changes "-inbox")
                             (find (lambda (r) (equal? (nm--th-id r) (nm--th-id th)))
                                   (list-entries buf)))))
@@ -2351,11 +2367,21 @@ them the address is live, so a purge never follows one."
 (define (nm--tag-marked! buf changes)
   (if (not (nm--any-marked? buf))
       (message "No selected messages")
-      (begin
+      (let* ((close? (nm--changes-closes-detail? changes))
+             (s (and close? (nm--selection buf)))
+             (explicit-ids (if (and s (not (caddr s))) (list-ref s 3) '()))
+             (before-ids (if close? (map nm--th-id (list-entries buf)) '())))
         (nm--op 'tag! changes (nm--marked-query buf))
         ;; Keep the local selection across the refresh. The selected thread IDs
         ;; remain valid even when their displayed tags change.
-        (nm--after-change! buf))))
+        (nm--after-change! buf)
+        (when close?
+          (let ((after-ids (map nm--th-id (list-entries buf))))
+            (for-each nm--close-thread-buffer! explicit-ids)
+            (for-each (lambda (id)
+                        (unless (member id after-ids)
+                          (nm--close-thread-buffer! id)))
+                      before-ids))))))
 
 (define (nm--toggle-selection! buf id)
   (let* ((s (nm--selection buf))
@@ -3218,14 +3244,21 @@ else{var p=null;try{p=readline()}catch(e){}
     (run-command "quit-window"))
   'modes '(notmuch-show-mode))
 
-(define-command "notmuch-show-archive" "Archive this thread and go back"
+(define-command "notmuch-show-archive" "Archive this thread and close its detail view"
   (lambda ()
-    (let ((th (buffer-local-value 'notmuch-thread (current-buffer))))
+    (let* ((buf (current-buffer))
+           (th (buffer-local-value 'notmuch-thread buf)))
       (when th
         (nm--op 'tag! "-inbox" (string-append "thread:" th))
-        (run-command "quit-window")
         (when (buffer-exists? *notmuch-search-buffer*)
           (nm--refresh! *notmuch-search-buffer*))
+        (set! *nm-dismissed* (and (buffer-exists? *notmuch-search-buffer*)
+                                  (nm--id-at *notmuch-search-buffer*)))
+        (run-command "quit-window")
+        (when (buffer-exists? buf) (buffer-kill! buf))
+        (let ((idx (and (buffer-exists? *notmuch-search-buffer*)
+                        (window-showing *notmuch-search-buffer*))))
+          (when idx (select-window! idx)))
         (message "Archived"))))
   'modes '(notmuch-show-mode))
 
@@ -3779,11 +3812,13 @@ its own Content-Type goes as it is."
       ((= n 0) (string-append "no such thread: " id))
       (else
         (nm--op 'tag! changes (string-append "thread:" id))
+        (when (nm--changes-closes-detail? changes)
+          (nm--close-thread-buffer! id))
         (when (buffer-exists? *notmuch-search-buffer*)
           (nm--refresh! *notmuch-search-buffer*))
-          (string-append "tagged " (number->string n) " message"
-                         (if (= n 1) "" "s") " in thread " id
-                         " (" changes ")")))))
+        (string-append "tagged " (number->string n) " message"
+                       (if (= n 1) "" "s") " in thread " id
+                       " (" changes ")")))))
 
 (define (notmuch-sender-count query limit)
   (let* ((raw (nm--op 'senders query))
