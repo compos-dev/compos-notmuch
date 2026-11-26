@@ -3040,6 +3040,9 @@ else{var p=null;try{p=readline()}catch(e){}
   (lambda ()
     (let ((buf (current-buffer)))
       (buffer-set-read-only! buf #t)
+      ;; a mail's buttons and links need the reader's login and cookies:
+      ;; they open in the group's own browser window, not as fetched text
+      (buffer-set-local! buf 'preview-web-links 'browser)
       (when (buffer-known? *notmuch-search-buffer*)
         (buffer-child! *notmuch-search-buffer* buf))
       (let ((th (buffer-local-value 'notmuch-thread buf)))
