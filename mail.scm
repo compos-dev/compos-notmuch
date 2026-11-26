@@ -583,11 +583,23 @@ mail-threads mail-thread[marked=true]:not(.selected) {
 
 ;; Tabs over the list: each one is a whole search, not a filter on top.
 ;; Taking a tab replaces the base query and drops the filters.
-(define nm-tabs
+(define nm-tabs-notmuch
   '(("inbox" "Inbox" "tag:inbox")
     ("unread" "Unread" "tag:inbox and tag:unread")
     ("important" "Important" "tag:inbox and tag:important")
     ("newsletter" "Newsletters" "tag:newsletter and date:30d..")))
+
+;; A Gmail mailbox gets Gmail's own category tabs; its backend reads each
+;; category as a tag.
+(define nm-tabs-gmail
+  '(("primary" "Primary" "tag:inbox and tag:personal")
+    ("promotions" "Promotions" "tag:inbox and tag:promotions")
+    ("social" "Social" "tag:inbox and tag:social")
+    ("updates" "Updates" "tag:inbox and tag:updates")
+    ("forums" "Forums" "tag:inbox and tag:forums")))
+
+(define (nm--tab-list)
+  (if (string-prefix? "gmail:" notmuch-host) nm-tabs-gmail nm-tabs-notmuch))
 
 ;; Thread counts for every tab in one trip to the mail host, kept until the
 ;; next refresh (g, a tab, or a tag change) so a redraw costs nothing.
@@ -603,21 +615,21 @@ mail-threads mail-thread[marked=true]:not(.selected) {
               (map (lambda (t)
                      (let ((n (ignore-errors (lambda () (nm--op 'count (caddr t))))))
                        (if (number? n) (number->string n) "")))
-                   nm-tabs))
+                   (nm--tab-list)))
             (lambda (ok? counts)
               (when (buffer-known? buf)
                 (buffer-set-local! buf 'nm-tab-counts-pending #f)
                 (when ok?
                   (buffer-set-local! buf 'nm-tab-counts counts)
                   (list-refresh! buf))))))
-        (map (lambda (t) "") nm-tabs))))
+        (map (lambda (t) "") (nm--tab-list)))))
 
 (define (nm--tabs buf)
   (let ((base (nm--query-base-of buf))
         (plain? (null? (nm--query-filters-of buf)))
         (counts (nm--tab-counts buf)))
     (tab-bars-keyed 'index
-      (let loop ((ts nm-tabs) (cs counts) (acc '()))
+      (let loop ((ts (nm--tab-list)) (cs counts) (acc '()))
         (if (null? ts) (reverse acc)
             (let ((t (car ts)) (c (car cs)))
               (loop (cdr ts) (cdr cs)
@@ -627,7 +639,7 @@ mail-threads mail-thread[marked=true]:not(.selected) {
                           acc))))))))
 
 (define (nm--take-tab! buf id)
-  (let ((t (assoc id nm-tabs)))
+  (let ((t (assoc id (nm--tab-list))))
     (when t
       (buffer-set-local! buf 'notmuch-selection #f)
       (buffer-set-local! buf 'notmuch-query-base (caddr t))
@@ -1934,7 +1946,9 @@ go on mail-tag:PROFILE as a tagged event, with the first message's From and Subj
     (debounce! 'notmuch-autotag-new (* 1000 notmuch-autotag-new-seconds)
                (lambda (x) (nm--autotag-new-tick x)) #f)))
 
-(when notmuch-autotag-new-enabled (nm--autotag-new-tick #f))
+(define (nm--autotag-new-boot!)
+  (when notmuch-autotag-new-enabled (nm--autotag-new-tick #f)))
+(after-init 'nm--autotag-new-boot!)
 
 
 
@@ -2827,6 +2841,8 @@ else{var p=null;try{p=readline()}catch(e){}
       "<mail-date>" (html-escape (or (plist-get h 'Date) "")) "</mail-date>"
       (let ((to (plist-get h 'To)))
         (if to (string-append " · to <mail-to>" (html-escape to) "</mail-to>") ""))
+      (let ((cc (plist-get h 'Cc)))
+        (if (and cc (not (equal? cc ""))) (string-append " · cc <mail-cc>" (html-escape cc) "</mail-cc>") ""))
       "</header><mail-body>" body "</mail-body>" (nm--attachment-html msg raw) "</mail-message>")))
 
 (define (nm--msg-anchor-name msg)
@@ -2853,11 +2869,41 @@ else{var p=null;try{p=readline()}catch(e){}
     "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>"
     (html-escape subject)
     "</title><style>mail-thread,mail-message,mail-body,mail-attachments,mail-attachment{display:block}"
-    "mail-message>header{border-top:1px solid #d0c8b8;margin-top:14px;padding:6px 0;font:12px system-ui;color:#666}"
-    "mail-from{font-weight:bold}"
-    "details.mail-quoted{margin:8px 0}"
-    "details.mail-quoted>summary{cursor:pointer;color:#888;font:12px system-ui;list-style:none}"
-    "mail-attachments{margin:14px 0 4px;padding:10px 12px;border:1px solid #d0c8b8;border-radius:8px;font:12px system-ui}"
+    ;; each message is a card; the rules mix the text colour, so they follow the theme
+    "mail-thread{max-width:760px}"
+    "mail-message{margin:14px 0;padding:14px 18px;border:1px solid color-mix(in srgb,currentColor 14%,transparent);border-radius:10px}"
+    ;; the header: sender left, date right, recipients below. font-size:0 drops
+    ;; the bare ' · ' separators the markup carries for the text tools
+    "mail-message>header{display:grid;grid-template-columns:1fr auto;gap:2px 12px;align-items:baseline;font-size:0;"
+    "padding:0 0 10px;margin:0 0 12px;border-bottom:1px solid color-mix(in srgb,currentColor 10%,transparent)}"
+    "mail-from{font:600 14px system-ui;color:var(--default-fg,#141310);overflow-wrap:anywhere}"
+    "mail-date{grid-column:2;grid-row:1;font:12px system-ui;color:#888;white-space:nowrap}"
+    "mail-to{grid-column:1/-1;font:12px system-ui;color:#888;overflow-wrap:anywhere}"
+    "mail-cc{grid-column:1/-1;font:12px system-ui;color:#888;overflow-wrap:anywhere}"
+    "mail-to::before{content:'to '}mail-cc::before{content:'cc '}"
+    ;; the message at point: anchor-mode's part, marked by the preview
+    "mail-message{transition:border-color .15s,box-shadow .15s,background-color .15s}"
+    ;; literal colours: the page's --accent-fg is empty, and an empty var
+    ;; drops the whole declaration instead of taking its fallback
+    "mail-message.anchor-current{border-color:#2f6fd6;background-color:rgba(47,111,214,.07);"
+    "box-shadow:inset 4px 0 0 #2f6fd6,0 0 0 3px rgba(47,111,214,.22),0 6px 18px rgba(47,111,214,.18)}"
+    "mail-body{font-size:14px;line-height:1.55;overflow-wrap:anywhere}"
+    "mail-body img{max-width:100%;height:auto}"
+    ;; a newsletter lays itself out in fixed-width tables: every box in the
+    ;; body fits the card, and what still will not scrolls inside the card
+    "mail-body{overflow-x:auto;min-width:0}"
+    "mail-body table,mail-body tbody,mail-body tr,mail-body td,mail-body th,mail-body div,mail-body center{max-width:100%!important;box-sizing:border-box}"
+    ;; a table's width attribute ignores max-width: one fixed in pixels
+    ;; sizes to its content instead, which fits the card
+    "mail-body table[width]:not([width$=\"%\"]){width:auto!important}"
+    "mail-body td,mail-body th{overflow-wrap:anywhere}"
+    "mail-body pre{margin:0}"
+    "details.mail-quoted{margin:10px 0 0}"
+    "details.mail-quoted>summary{display:inline-block;cursor:pointer;color:#888;font:12px system-ui;list-style:none;"
+    "padding:1px 10px;border-radius:999px;background:color-mix(in srgb,currentColor 7%,transparent)}"
+    "details.mail-quoted[open]>summary{margin-bottom:8px}"
+    "details.mail-quoted blockquote,details.mail-quoted .gmail_attr{opacity:.75}"
+    "mail-attachments{margin:14px 0 0;padding:10px 12px;border:1px solid color-mix(in srgb,currentColor 14%,transparent);border-radius:8px;font:12px system-ui}"
     "mail-attachments>strong{display:block;margin-bottom:8px}"
     "mail-attachments>small{display:block;margin-top:8px;color:#888}"
     "mail-attachment{display:inline-block;vertical-align:top;max-width:160px;margin:0 10px 6px 0;word-break:break-all}"
@@ -2867,9 +2913,9 @@ else{var p=null;try{p=readline()}catch(e){}
     "mail-attachment:has(.mail-file-icon){display:inline-flex;align-items:center;gap:6px;max-width:100%;word-break:normal;overflow-wrap:anywhere}"
     "i.mail-file-icon{flex:none;font:normal 22px/1 'Symbols Nerd Font Mono','JetBrainsMonoNL Nerd Font Mono','JetBrainsMono Nerd Font Mono','Hack Nerd Font Mono';color:#a83a2b}"
     ;; the title of the thread, and it reads as one: bold, full contrast,
-    ;; and clear of the first message's header rule
+    ;; and clear of the first message card
     "mail-subject{display:block;font:700 21px/1.3 system-ui;"
-    "color:var(--default-fg,#141310);margin:0 0 6px}</style></head>"
+    "color:var(--default-fg,#141310);margin:0 0 4px}</style></head>"
     "<body style=\"margin:14px;font-family:system-ui\"><mail-thread>"
     "<mail-subject>" (html-escape subject) "</mail-subject>"))
 
@@ -3002,6 +3048,9 @@ else{var p=null;try{p=readline()}catch(e){}
   (lambda ()
     (let ((buf (current-buffer)))
       (buffer-set-read-only! buf #t)
+      ;; a mail's buttons and links need the reader's login and cookies:
+      ;; they open in the group's own browser window, not as fetched text
+      (buffer-set-local! buf 'preview-web-links 'browser)
       (when (buffer-known? *notmuch-search-buffer*)
         (buffer-child! *notmuch-search-buffer* buf))
       (let ((th (buffer-local-value 'notmuch-thread buf)))
@@ -3012,8 +3061,7 @@ else{var p=null;try{p=readline()}catch(e){}
           (let* ((subject (or (buffer-local-value 'notmuch-subject buf) ""))
                  (msgs (nm--show-msgs th))
                  (html? (and notmuch-prefer-html
-                             (not (equal? (buffer-local-value 'notmuch-view buf) "text"))
-                             (nm--any-html? msgs))))
+                             (not (equal? (buffer-local-value 'notmuch-view buf) "text")))))
             (desktop-skip! buf 'notmuch-attachments)
             (desktop-skip! buf 'nm-attachment-source)
             (buffer-set-local! buf 'notmuch-attachments (nm--attachment-options msgs))
@@ -3517,6 +3565,36 @@ its own Content-Type goes as it is."
                                  nm--blockquote-open (cadr rq) "</blockquote></div>")
                                (mail-markdown->html body))))
                 (string-append head "\nMIME-Version: 1.0\n" (mail-alternative-part body html))))))))
+(define (mail-reply! target body &optional opts)
+  "(mail-reply! MSG-ID BODY [OPTS]) — reply to the message MSG-ID (id: and <> optional) with BODY, in its thread. It finds the mailbox that holds MSG-ID (the current one, then each of mail-feed-profiles), and notmuch fills From, To, Cc, Subject, In-Reply-To and References from it, so the reply goes out from the address the mail came to; the From picks the send route. OPTS: 'sender-only #t answers the sender alone (default all), 'cc adds addresses, 'no-quote #t leaves the original out, 'mailbox (HOST PROFILE) skips the search, 'dry-run #t answers the RFC 822 text instead of sending. #t when sent, else the error as a string"
+  (let* ((t0 (string-trim target))
+         (t1 (if (string-prefix? "id:" t0) (substring t0 3 (string-length t0)) t0))
+         (id (if (and (string-prefix? "<" t1) (string-suffix? ">" t1)) (substring t1 1 (- (string-length t1) 1)) t1))
+         (holds? (lambda (mb) (let ((n (string-trim (nm--run (string-append "count -- id:" (sh-quote id)) mb))))
+                                (and (not (equal? n "")) (not (equal? n "0")) (string->number n)))))
+         (mb (or (plist-get opts 'mailbox)
+                 (let loop ((ms (cons (list notmuch-host notmuch-profile) (map mail-feed--mailbox mail-feed-profiles))))
+                   (cond ((null? ms) #f) ((holds? (car ms)) (car ms)) (else (loop (cdr ms)))))))
+         (j (and mb (json-parse (nm--run (string-append "reply --format=json --reply-to="
+                                                        (if (plist-get opts 'sender-only) "sender" "all")
+                                                        " id:" (sh-quote id)) mb))))
+         (rh (and j (plist-get j 'reply-headers)))
+         (orig (and j (plist-get j 'original))))
+    (if (not rh)
+        (string-append "mail-reply!: no mailbox holds message " id)
+        (let* ((extra (plist-get opts 'cc))
+               (cc0 (plist-get rh 'Cc))
+               (cc (if (and cc0 extra) (string-append cc0 ", " extra) (or cc0 extra)))
+               (oh (and orig (plist-get orig 'headers)))
+               (quoted (if (or (not orig) (plist-get opts 'no-quote)) ""
+                           (string-append "\n\n" (if (and oh (plist-get oh 'From)) (string-append (plist-get oh 'From) " writes:\n\n") "")
+                                          (nm--quote-text (nm--msg-body-text orig)))))
+               (msg (mail-message (list 'from (plist-get rh 'From) 'to (plist-get rh 'To) 'cc cc
+                                        'subject (plist-get rh 'Subject)
+                                        'in-reply-to (plist-get rh 'In-reply-to)
+                                        'references (plist-get rh 'References))
+                                  (string-append body quoted))))
+          (if (plist-get opts 'dry-run) msg (mail-send-text! msg))))))
 
 (define-command "mail-send" "Send this buffer as an email"
   (lambda ()
@@ -3728,6 +3806,7 @@ its own Content-Type goes as it is."
 (public! 'mail-alternative-part "(mail-alternative-part TEXT HTML) — a multipart/alternative MIME part of TEXT and HTML")
 (public! 'mail-send! "(mail-send! HEADERS BODY [ATTACHMENTS]) — send a mail with files attached; #t when sent, else the error")
 (public! 'mail-send-text! "(mail-send-text! TEXT) — send RFC 822 TEXT through the route its From picks; #t when sent, else the error")
+(public! 'mail-reply! "(mail-reply! MSG-ID BODY [OPTS]) — reply in thread to a message, from whichever mailbox holds it; notmuch fills every header and the From picks the route. OPTS 'sender-only 'cc 'no-quote 'mailbox 'dry-run; #t when sent, else the error")
 (effects! '(unknown))
 (public! 'mail-tag!
   "(mail-tag! THREAD-ID CHANGES) — apply space-separated +tag/-tag changes to a thread; returns how many messages it actually matched (a real count, not a blind \"done\") — 0 means the thread id was wrong")
@@ -3906,8 +3985,10 @@ mail-feed-enabled starts the rest of the feed."
   (lambda () (mail-feed-stop!) (message "Mail feed off")))
 
 ;; after the load, not in it: a start inside the loader does not take
-(when mail-feed-enabled
-  (debounce! 'mail-feed-boot 0 (lambda (_) (mail-feed-start!)) #f))
+(define (mail-feed--boot!)
+  (when mail-feed-enabled
+    (debounce! 'mail-feed-boot 0 (lambda (_) (mail-feed-start!)) #f)))
+(after-init 'mail-feed--boot!)
 
 ;; Gmail mailboxes notify on their own: nothing pushes their mail, so the
 ;; poll is what makes a notice at all
