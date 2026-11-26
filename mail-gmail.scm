@@ -493,6 +493,24 @@
 
 ;; thread ID as if Gmail had taken the change already: its headers, its
 ;; whole text and every cached index row that holds it
+(define (gm--tag-terms-of query)
+  (let loop ((ws (gm--words (or query ""))) (acc '()))
+    (cond ((null? ws) (reverse acc))
+          ((equal? (string-downcase (car ws)) "and") (loop (cdr ws) acc))
+          ((member (car ws) '("(" ")")) #f)
+          ((member (string-downcase (car ws)) '("or" "not")) #f)
+          (else
+           (let* ((w (car ws)) (neg? (string-prefix? "-" w)) (w (if neg? (substring w 1 (string-length w)) w))
+                  (colon (gm--index w #\:)))
+             (if (and colon (equal? (string-downcase (substring w 0 colon)) "tag"))
+                 (loop (cdr ws) (cons (cons (gm--unquote (substring w (+ colon 1) (string-length w))) neg?) acc))
+                 #f))))))
+
+(define (gm--row-matches-tags? query tags)
+  (let ((terms (gm--tag-terms-of query)))
+    (or (not terms)
+        (not (find (lambda (tn) (if (cdr tn) (member (car tn) tags) (not (member (car tn) tags)))) terms)))))
+
 (define (gm--relabel-cached! id add drop cs)
   (let ((relabel (lambda (e) (if (equal? (car e) id) (list (car e) (cadr e) (gm--relabel-json (caddr e) add drop)) e))))
     (set! *gm-threads* (map relabel *gm-threads*))
@@ -504,15 +522,20 @@
      (lambda (e)
        (if (not (and (pair? (car e)) (eq? (car (car e)) 'search)))
          e
-         (list (car e) (cadr e)
-           (map (lambda (r)
-                  (if (equal? (plist-get r 'thread) id)
-                      (gm--plist-set r 'tags
-                        (append (filter (lambda (t) (not (member t minus))) (plist-get r 'tags))
-                                (filter (lambda (t) (not (member t (plist-get r 'tags)))) plus)))
-                      r))
-                (caddr e))
-           (cadddr e))))
+         (let* ((query (caddr (car e)))
+                (relabeled
+                 (map (lambda (r)
+                        (if (equal? (plist-get r 'thread) id)
+                            (gm--plist-set r 'tags
+                              (append (filter (lambda (t) (not (member t minus))) (plist-get r 'tags))
+                                      (filter (lambda (t) (not (member t (plist-get r 'tags)))) plus)))
+                            r))
+                      (caddr e))))
+           (list (car e) (cadr e)
+             (filter (lambda (r) (or (not (equal? (plist-get r 'thread) id))
+                                      (gm--row-matches-tags? query (plist-get r 'tags))))
+                     relabeled)
+             (cadddr e)))))
      *gm-swr*))))
 
 ;; a modify answers the thread: its new historyId keeps the caches current
