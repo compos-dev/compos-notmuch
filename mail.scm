@@ -290,7 +290,8 @@ when a message has no text/plain part." 'group 'notmuch)
 ;;;   block-sender! MB ADDRESS       future mail from ADDRESS is junked on arrival
 ;;;   send MB TEXT                   optional: send RFC 822 TEXT; #t or the error
 
-(define *mail-backends* '())
+(defvar '*mail-backends* '()
+  "Registered mail backends as ((KIND . OPS) ...); kept across reloads of mail.scm.")
 
 (define (mail-backend-register! kind ops)
   "(mail-backend-register! KIND OPS) — make KIND a mail backend; OPS is a plist of operation procedures"
@@ -606,23 +607,33 @@ mail-threads mail-thread[marked=true]:not(.selected) {
 (define (nm--tab-counts buf)
   ;; through the backend, in a task: a redraw never waits on the mail host.
   ;; The tabs draw without counts until they arrive, then draw again.
-  (or (buffer-local-value 'nm-tab-counts buf)
-      (begin
-        (unless (buffer-local-value 'nm-tab-counts-pending buf)
-          (buffer-set-local! buf 'nm-tab-counts-pending #t)
-          (task-run!
-            (lambda ()
-              (map (lambda (t)
-                     (let ((n (ignore-errors (lambda () (nm--op 'count (caddr t))))))
-                       (if (number? n) (number->string n) "")))
-                   (nm--tab-list)))
-            (lambda (ok? counts)
-              (when (buffer-known? buf)
-                (buffer-set-local! buf 'nm-tab-counts-pending #f)
-                (when ok?
-                  (buffer-set-local! buf 'nm-tab-counts counts)
-                  (list-refresh! buf))))))
-        (map (lambda (t) "") (nm--tab-list)))))
+  (desktop-skip! buf 'nm-tab-counts)
+  (desktop-skip! buf 'nm-tab-counts-pending)
+  (let* ((tabs (nm--tab-list))
+         (key (nm--db-key))
+         (hit (buffer-local-value 'nm-tab-counts buf)))
+    (if (and (pair? hit)
+             (equal? (car hit) key)
+             (pair? (cadr hit))
+             (= (length (cadr hit)) (length tabs)))
+        (cadr hit)
+        (begin
+          (unless (equal? (buffer-local-value 'nm-tab-counts-pending buf) key)
+            (buffer-set-local! buf 'nm-tab-counts-pending key)
+            (task-run!
+              (lambda ()
+                (map (lambda (t)
+                       (let ((n (ignore-errors (lambda () (nm--op 'count (caddr t))))))
+                         (if (number? n) (number->string n) "")))
+                     tabs))
+              (lambda (ok? counts)
+                (when (buffer-known? buf)
+                  (when (equal? (buffer-local-value 'nm-tab-counts-pending buf) key)
+                    (buffer-set-local! buf 'nm-tab-counts-pending #f))
+                  (when (and ok? (equal? (nm--db-key) key))
+                    (buffer-set-local! buf 'nm-tab-counts (list key counts))
+                    (list-refresh! buf))))))
+          (map (lambda (t) "") tabs)))))
 
 (define (nm--tabs buf)
   (let ((base (nm--query-base-of buf))
@@ -631,8 +642,9 @@ mail-threads mail-thread[marked=true]:not(.selected) {
     (tab-bars-keyed 'index
       (let loop ((ts (nm--tab-list)) (cs counts) (acc '()))
         (if (null? ts) (reverse acc)
-            (let ((t (car ts)) (c (car cs)))
-              (loop (cdr ts) (cdr cs)
+            (let ((t (car ts))
+                  (c (if (pair? cs) (car cs) "")))
+              (loop (cdr ts) (if (pair? cs) (cdr cs) '())
                     (cons (list (string-append "notmuch-tab-" (car t))
                                 (if (equal? c "") (cadr t) (string-append (cadr t) " " c))
                                 (and plain? (equal? base (caddr t))))
@@ -965,6 +977,9 @@ mail-threads mail-thread[marked=true]:not(.selected) {
               (when (buffer-exists? b) (buffer-set-local! b 'list-entries '())))
             (list *notmuch-search-buffer* *notmuch-hello-buffer*))
   (when (buffer-exists? *notmuch-search-buffer*)
+    (buffer-set-local! *notmuch-search-buffer* 'nm-count #f)
+    (buffer-set-local! *notmuch-search-buffer* 'nm-tab-counts #f)
+    (buffer-set-local! *notmuch-search-buffer* 'nm-tab-counts-pending #f)
     (nm--query-reset! *notmuch-search-buffer* notmuch-default-query))
   (list-refresh! buf)
   (message (string-append "Mail on " (nm--source-label))))
@@ -1319,11 +1334,15 @@ mail-threads mail-thread[marked=true]:not(.selected) {
         (begin
           (nm--op 'tag! changes (string-append "thread:" (nm--th-id th)))
           (nm--after-change! buf pos)
-          (message
-            (if (and (equal? changes "-inbox")
-                     (member (nm--th-id th) (map nm--th-id (list-entries buf))))
-                "Archive: this search also includes mail outside the inbox"
-                changes)))
+          (let ((still (and (equal? changes "-inbox")
+                            (find (lambda (r) (equal? (nm--th-id r) (nm--th-id th)))
+                                  (list-entries buf)))))
+            (message
+              (cond ((not still) changes)
+                    ((member "inbox" (nm--th-tags still))
+                     "Archive failed: thread still has inbox tag")
+                    (else
+                     "Archived (-inbox; this search also shows mail outside the inbox)")))))
         (message "No thread on this line"))))
 
 ;; A mark is a standing instruction, so the verb obeys the marks while
@@ -3146,7 +3165,7 @@ else{var p=null;try{p=readline()}catch(e){}
   (let* ((old (nm--thread-buffer thread-id))
          (buf (or old (let ((name (nm--thread-buffer-name subject))) (buffer-create name) name)))
          (read-at (buffer-local-value 'nm-read-at buf))
-         (fresh? (and old (number? read-at) (< (- (monotonic-ms) read-at) nm--page-fresh-ms))))
+         (fresh? (and old (> (buffer-size buf) 0) (number? read-at) (< (- (monotonic-ms) read-at) nm--page-fresh-ms))))
     (buffer-set-local! buf 'notmuch-thread thread-id)
     (buffer-set-local! buf 'notmuch-subject subject)
     (buffer-set-local! buf 'nm-db (nm--db-key))

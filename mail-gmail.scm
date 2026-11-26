@@ -493,23 +493,50 @@
 
 ;; thread ID as if Gmail had taken the change already: its headers, its
 ;; whole text and every cached index row that holds it
-(define (gm--tag-terms-of query)
-  (let loop ((ws (gm--words (or query ""))) (acc '()))
-    (cond ((null? ws) (reverse acc))
-          ((equal? (string-downcase (car ws)) "and") (loop (cdr ws) acc))
-          ((member (car ws) '("(" ")")) #f)
-          ((member (string-downcase (car ws)) '("or" "not")) #f)
-          (else
-           (let* ((w (car ws)) (neg? (string-prefix? "-" w)) (w (if neg? (substring w 1 (string-length w)) w))
-                  (colon (gm--index w #\:)))
-             (if (and colon (equal? (string-downcase (substring w 0 colon)) "tag"))
-                 (loop (cdr ws) (cons (cons (gm--unquote (substring w (+ colon 1) (string-length w))) neg?) acc))
-                 #f))))))
+(define (gm--parse-groups ws)
+  (let loop ((ws ws) (acc '()))
+    (cond ((null? ws) (cons (reverse acc) '()))
+          ((equal? (car ws) ")") (cons (reverse acc) (cdr ws)))
+          ((equal? (car ws) "(")
+           (let ((sub (gm--parse-groups (cdr ws))))
+             (loop (cdr sub) (cons (car sub) acc))))
+          (else (loop (cdr ws) (cons (car ws) acc))))))
 
-(define (gm--row-matches-tags? query tags)
-  (let ((terms (gm--tag-terms-of query)))
-    (or (not terms)
-        (not (find (lambda (tn) (if (cdr tn) (member (car tn) tags) (not (member (car tn) tags)))) terms)))))
+(define (gm--extract-required-tags items)
+  (if (find (lambda (x) (and (string? x) (equal? (string-downcase x) "or"))) items)
+      '()
+      (let loop ((xs items) (neg? #f) (acc '()))
+        (if (null? xs)
+            (reverse acc)
+            (let ((x (car xs)))
+              (cond ((pair? x)
+                     (loop (cdr xs) #f
+                           (if neg? acc (append (reverse (gm--extract-required-tags x)) acc))))
+                    ((equal? (string-downcase x) "and") (loop (cdr xs) #f acc))
+                    ((equal? (string-downcase x) "not") (loop (cdr xs) (not neg?) acc))
+                    (else
+                     (let* ((dash? (string-prefix? "-" x))
+                            (w (if dash? (substring x 1 (string-length x)) x))
+                            (colon (gm--index w #\:)))
+                       (if (and colon (equal? (string-downcase (substring w 0 colon)) "tag"))
+                           (let ((tag (gm--unquote (substring w (+ colon 1) (string-length w))))
+                                 (neg (if neg? (not dash?) dash?)))
+                             (loop (cdr xs) #f (cons (cons tag neg) acc)))
+                           (loop (cdr xs) #f acc))))))))))
+
+(define (gm--required-tag-terms query)
+  (gm--extract-required-tags (car (gm--parse-groups (gm--words (or query ""))))))
+
+(define (gm--change-invalidates-query? query plus minus)
+  (let ((terms (gm--required-tag-terms query)))
+    (and (pair? terms)
+         (find (lambda (tn)
+                 (let ((tag (car tn)) (neg? (cdr tn)))
+                   (if neg?
+                       (and (member tag plus) (not (member tag minus)))
+                       (and (member tag minus) (not (member tag plus))))))
+               terms)
+         #t)))
 
 (define (gm--relabel-cached! id add drop cs)
   (let ((relabel (lambda (e) (if (equal? (car e) id) (list (car e) (cadr e) (gm--relabel-json (caddr e) add drop)) e))))
@@ -518,25 +545,23 @@
   (let ((plus (map cadr (filter (lambda (c) (char=? (car c) #\+)) cs)))
         (minus (map cadr (filter (lambda (c) (char=? (car c) #\-)) cs))))
     (set! *gm-swr*
-     (map
-     (lambda (e)
-       (if (not (and (pair? (car e)) (eq? (car (car e)) 'search)))
-         e
-         (let* ((query (caddr (car e)))
-                (relabeled
-                 (map (lambda (r)
-                        (if (equal? (plist-get r 'thread) id)
-                            (gm--plist-set r 'tags
-                              (append (filter (lambda (t) (not (member t minus))) (plist-get r 'tags))
-                                      (filter (lambda (t) (not (member t (plist-get r 'tags)))) plus)))
-                            r))
-                      (caddr e))))
-           (list (car e) (cadr e)
-             (filter (lambda (r) (or (not (equal? (plist-get r 'thread) id))
-                                      (gm--row-matches-tags? query (plist-get r 'tags))))
-                     relabeled)
-             (cadddr e)))))
-     *gm-swr*))))
+      (map
+        (lambda (e)
+          (if (not (and (pair? (car e)) (eq? (car (car e)) 'search)))
+              e
+              (let* ((query (caddr (car e)))
+                     (drop-row? (gm--change-invalidates-query? query plus minus))
+                     (rows (if drop-row?
+                               (filter (lambda (r) (not (equal? (plist-get r 'thread) id))) (caddr e))
+                               (map (lambda (r)
+                                      (if (equal? (plist-get r 'thread) id)
+                                          (gm--plist-set r 'tags
+                                            (append (filter (lambda (t) (not (member t minus))) (plist-get r 'tags))
+                                                    (filter (lambda (t) (not (member t (plist-get r 'tags)))) plus)))
+                                          r))
+                                    (caddr e)))))
+                (list (car e) (cadr e) rows (cadddr e)))))
+        *gm-swr*))))
 
 ;; a modify answers the thread: its new historyId keeps the caches current
 (define (gm--history-from! j)
@@ -572,6 +597,8 @@
                  (let ((n (min 1000 (length ids))))
                    (gm--post mb "/messages/batchModify" (append (list 'ids (list-head ids n)) body))
                    (loop (list-tail ids n)))))
+             (for-each (lambda (id) (gm--relabel-cached! id add drop cs))
+                       (gm--dedupe (map cadr ms)))
              "")))))
 
 ;;; --- counting
