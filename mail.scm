@@ -2889,6 +2889,11 @@ else{var p=null;try{p=readline()}catch(e){}
     "box-shadow:inset 4px 0 0 #2f6fd6,0 0 0 3px rgba(47,111,214,.22),0 6px 18px rgba(47,111,214,.18)}"
     "mail-body{font-size:14px;line-height:1.55;overflow-wrap:anywhere}"
     "mail-body img{max-width:100%;height:auto}"
+    ;; a newsletter lays itself out in fixed-width tables: every box in the
+    ;; body fits the card, and what still will not scrolls inside the card
+    "mail-body{overflow-x:auto;min-width:0}"
+    "mail-body table,mail-body tbody,mail-body tr,mail-body td,mail-body th,mail-body div,mail-body center{max-width:100%!important;box-sizing:border-box}"
+    "mail-body td,mail-body th{overflow-wrap:anywhere}"
     "mail-body pre{margin:0}"
     "details.mail-quoted{margin:10px 0 0}"
     "details.mail-quoted>summary{display:inline-block;cursor:pointer;color:#888;font:12px system-ui;list-style:none;"
